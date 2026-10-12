@@ -12,31 +12,34 @@ permissions:
 jobs:
   mac:
     runs-on: macos-15-intel
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Validate installer and metadata
         run: |
           bash -n mac/install.command
+          bash -n mac/build-app.command
           plutil -lint mac/Info.plist
-      - name: Compile Intel and Apple Silicon binaries
+      - name: Build universal app with signed update helper
         run: |
-          for arch in x86_64 arm64; do
-            xcrun swiftc -swift-version 5 -O -target "${arch}-apple-macosx12.0" \
-              -framework AppKit -framework AVFoundation -framework Security \
-              mac/StanMicBridge.swift -o "$RUNNER_TEMP/StanMicBridge-$arch"
-          done
-      - name: Verify release policy without starting capture
-        run: '"$RUNNER_TEMP/StanMicBridge-x86_64" --test-updates'
-      - name: Generate and validate app icon
+          bash mac/build-app.command "$RUNNER_TEMP/package" --universal
+          lipo -verify_arch x86_64 arm64 "$RUNNER_TEMP/package/Stan Mic Bridge.app/Contents/MacOS/StanMicBridge"
+          lipo -verify_arch x86_64 arm64 "$RUNNER_TEMP/package/Stan Mic Bridge.app/Contents/Helpers/StanMicUpdater"
+      - name: Verify update policies and rollback without capture
         run: |
-          xcrun swiftc -swift-version 5 -framework AppKit mac/GenerateIcon.swift -o "$RUNNER_TEMP/GenerateIcon"
-          "$RUNNER_TEMP/GenerateIcon" "$RUNNER_TEMP/AppIcon.iconset"
-          iconutil -c icns "$RUNNER_TEMP/AppIcon.iconset" -o "$RUNNER_TEMP/AppIcon.icns"
-          test -s "$RUNNER_TEMP/AppIcon.icns"
+          "$RUNNER_TEMP/package/Stan Mic Bridge.app/Contents/MacOS/StanMicBridge" --test-updates
+          "$RUNNER_TEMP/package/Stan Mic Bridge.app/Contents/Helpers/StanMicUpdater" --self-test
+      - name: Package app
+        run: |
+          cd "$RUNNER_TEMP/package"
+          zip -q -r StanMicBridge-macOS.zip "Stan Mic Bridge.app"
+          shasum -a 256 StanMicBridge-macOS.zip > SHA256-binary.txt
+          version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "Stan Mic Bridge.app/Contents/Info.plist")
+          digest=$(cut -d' ' -f1 SHA256-binary.txt)
+          "Stan Mic Bridge.app/Contents/MacOS/StanMicBridge" --test-update-package "$RUNNER_TEMP/package/StanMicBridge-macOS.zip" "v$version" "$digest"
       - uses: actions/upload-artifact@v4
         with:
-          name: app-icon
+          name: mac-app
           path: |
-            ${{ runner.temp }}/AppIcon.icns
-            ${{ runner.temp }}/AppIcon.iconset/icon_512x512@2x.png
+            ${{ runner.temp }}/package/StanMicBridge-macOS.zip
+            ${{ runner.temp }}/package/SHA256-binary.txt

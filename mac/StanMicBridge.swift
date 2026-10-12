@@ -1,6 +1,8 @@
 import AppKit
 import AVFoundation
 import Security
+import CryptoKit
+import Darwin
 
 // macOS 12+, Swift 5. No audio files, transcripts, or credential-bearing logs.
 // All lifecycle and socket state belongs to the main thread. The audio tap only
@@ -97,11 +99,29 @@ private struct StableVersion: Comparable {
 }
 
 private struct PublicRelease: Decodable {
+    struct Asset: Decodable {
+        let name: String
+        let browser_download_url: String
+        let digest: String?
+        let size: Int
+    }
     let tag_name: String
     let html_url: String
     let body: String?
     let draft: Bool
     let prerelease: Bool
+    var assets: [Asset]? = nil
+
+    var installAsset: Asset? {
+        guard trustedURL != nil else { return nil }
+        let matches = (assets ?? []).filter { $0.name == "StanMicBridge-macOS.zip" }
+        guard matches.count == 1, let asset = matches.first,
+              asset.size > 0, asset.size <= 64 * 1024 * 1024,
+              asset.browser_download_url == "https://github.com/Cherith1222/stan-mic-bridge/releases/download/" + tag_name + "/StanMicBridge-macOS.zip",
+              let digest = asset.digest, digest.hasPrefix("sha256:"), digest.count == 71,
+              digest.dropFirst(7).allSatisfy({ "0123456789abcdef".contains($0) }) else { return nil }
+        return asset
+    }
 
     var stableVersion: StableVersion? {
         guard !draft, !prerelease else { return nil }
@@ -113,6 +133,131 @@ private struct PublicRelease: Decodable {
               parts.user == nil, parts.password == nil, parts.query == nil, parts.fragment == nil,
               parts.percentEncodedPath == "/Cherith1222/stan-mic-bridge/releases/tag/" + tag_name else { return nil }
         return parts.url
+    }
+}
+
+private enum InstallFailure: Error { case invalid }
+
+// This session never shares cookies, credentials, or the microphone URL.
+private final class ReleaseDownload: NSObject, URLSessionDataDelegate {
+    var completion: ((Result<Data, Error>) -> Void)?
+    var progress: ((Int) -> Void)?
+    private var bytes = Data()
+    private let expectedSize: Int
+    init(size: Int) { expectedSize = size }
+    static func allowedRedirect(_ url: URL?) -> Bool {
+        guard let url = url, let parts = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return false }
+        return parts.scheme == "https" && parts.port == nil && parts.user == nil && parts.password == nil
+            && ["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"].contains(parts.host ?? "")
+    }
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        guard Self.allowedRedirect(request.url), let url = request.url else { completionHandler(nil); return }
+        completionHandler(URLRequest(url: url))
+    }
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        guard let response = response as? HTTPURLResponse, response.statusCode == 200,
+              Self.allowedRedirect(response.url),
+              response.expectedContentLength == -1 || response.expectedContentLength == Int64(expectedSize) else {
+            completionHandler(.cancel); return
+        }
+        completionHandler(.allow)
+    }
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard bytes.count + data.count <= expectedSize else { dataTask.cancel(); return }
+        bytes.append(data)
+        progress?(bytes.count * 100 / expectedSize)
+    }
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error = error { completion?(.failure(error)) }
+        else if bytes.count != expectedSize { completion?(.failure(InstallFailure.invalid)) }
+        else { completion?(.success(bytes)) }
+        completion = nil
+        session.finishTasksAndInvalidate()
+    }
+}
+
+private enum UpdateStaging {
+    static func receiptRootName(_ name: String) -> Bool {
+        let prefix = "StanMicBridge-update-"
+        return name.hasPrefix(prefix) && UUID(uuidString: String(name.dropFirst(prefix.count))) != nil
+    }
+    static func acknowledgeStartup() {
+        let arguments = CommandLine.arguments
+        guard arguments.count == 3, arguments[1] == "--update-ready" else { return }
+        let receipt = URL(fileURLWithPath: arguments[2]).standardizedFileURL
+        let root = receipt.deletingLastPathComponent()
+        let temporary = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().standardizedFileURL
+        guard receipt.lastPathComponent == "update-ready.json", receiptRootName(root.lastPathComponent),
+              root.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL == temporary,
+              root.resolvingSymlinksInPath() == temporary.appendingPathComponent(root.lastPathComponent, isDirectory: true),
+              let attributes = try? FileManager.default.attributesOfItem(atPath: root.path),
+              attributes[.type] as? FileAttributeType == .typeDirectory,
+              (attributes[.ownerAccountID] as? NSNumber)?.uint32Value == geteuid(),
+              (attributes[.posixPermissions] as? NSNumber)?.intValue == 0o700,
+              (try? FileManager.default.attributesOfItem(atPath: receipt.path)) == nil,
+              let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+              let data = try? JSONSerialization.data(withJSONObject: ["pid": ProcessInfo.processInfo.processIdentifier, "build": build] as [String: Any]) else { return }
+        try? data.write(to: receipt, options: .atomic)
+    }
+    static func command(_ path: String, _ arguments: [String]) throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let timeout = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 45, execute: timeout)
+        defer { timeout.cancel() }
+        var output = Data()
+        while let data = try pipe.fileHandleForReading.read(upToCount: 65536), !data.isEmpty {
+            output.append(data)
+            if output.count > 2 * 1024 * 1024 { process.terminate(); throw InstallFailure.invalid }
+        }
+        process.waitUntilExit()
+        guard process.terminationStatus == 0, let text = String(data: output, encoding: .utf8) else { throw InstallFailure.invalid }
+        return text
+    }
+    static func safeEntry(_ name: String) -> Bool {
+        guard name.hasPrefix("Stan Mic Bridge.app/"), !name.contains("\\"), !name.contains("\r"),
+              !name.contains("\0") else { return false }
+        return !name.split(separator: "/", omittingEmptySubsequences: false).contains(where: { $0 == ".." || $0 == "." })
+    }
+    static func prepare(_ data: Data, release: PublicRelease, root: URL) throws -> URL {
+        guard let asset = release.installAsset,
+              "sha256:" + SHA256.hash(data: data).map({ String(format: "%02x", $0) }).joined() == asset.digest else { throw InstallFailure.invalid }
+        let archive = root.appendingPathComponent("update.zip")
+        try data.write(to: archive, options: .atomic)
+        let entries = try command("/usr/bin/unzip", ["-Z1", archive.path]).split(separator: "\n").map(String.init)
+        guard !entries.isEmpty, entries.count < 10000, Set(entries).count == entries.count,
+              entries.allSatisfy(safeEntry) else { throw InstallFailure.invalid }
+        let details = try command("/usr/bin/zipinfo", ["-l", archive.path]).split(separator: "\n")
+        var count = 0
+        var total: Int64 = 0
+        for line in details {
+            let fields = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
+            // zipinfo's Unix mode field must identify only regular files or directories.
+            guard let mode = fields.first, mode.count == 10 else { continue }
+            guard mode.first == "-" || mode.first == "d", fields.count >= 9,
+                  let size = Int64(fields[3]), size >= 0, size <= 256 * 1024 * 1024 else { throw InstallFailure.invalid }
+            count += 1
+            total += size
+            guard total <= 256 * 1024 * 1024 else { throw InstallFailure.invalid }
+        }
+        guard count == entries.count else { throw InstallFailure.invalid }
+        let directory = root.appendingPathComponent("expanded", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        _ = try command("/usr/bin/ditto", ["-x", "-k", archive.path, directory.path])
+        let app = directory.appendingPathComponent("Stan Mic Bridge.app", isDirectory: true)
+        guard let bundle = Bundle(url: app), bundle.bundleIdentifier == "com.stan.micbridge",
+              let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+              StableVersion(version) == release.stableVersion else { throw InstallFailure.invalid }
+        _ = try command("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path])
+        return app
     }
 }
 
@@ -156,6 +301,33 @@ private func testUpdatePolicy() {
                 canonical.replacingOccurrences(of: "Cherith1222", with: "someone"),
                 canonical.replacingOccurrences(of: "v1.1.0", with: "v2.0.0")] {
         precondition(release(bad).trustedURL == nil)
+    }
+    let downloadURL = "https://github.com/Cherith1222/stan-mic-bridge/releases/download/v1.1.0/StanMicBridge-macOS.zip"
+    func candidate(_ url: String? = nil, digest: String? = "sha256:" + String(repeating: "a", count: 64), size: Int = 1024) -> PublicRelease {
+        var value = release(canonical)
+        value.assets = [.init(name: "StanMicBridge-macOS.zip", browser_download_url: url ?? downloadURL, digest: digest, size: size)]
+        return value
+    }
+    precondition(candidate().installAsset != nil)
+    precondition(release(canonical).installAsset == nil)
+    precondition(candidate(digest: nil).installAsset == nil)
+    precondition(candidate(digest: "sha256:" + String(repeating: "g", count: 64)).installAsset == nil)
+    precondition(candidate(size: 0).installAsset == nil)
+    precondition(candidate(size: 64 * 1024 * 1024 + 1).installAsset == nil)
+    for bad in [downloadURL + "?x=1", downloadURL.replacingOccurrences(of: "v1.1.0", with: "v2.0.0"),
+                downloadURL.replacingOccurrences(of: "github.com", with: "evil.test")] {
+        precondition(candidate(bad).installAsset == nil)
+    }
+    for bad in ["http://github.com/a", "https://github.com.evil.test/a", "https://user@github.com/a", "https://github.com:443/a"] {
+        precondition(!ReleaseDownload.allowedRedirect(URL(string: bad)))
+    }
+    precondition(ReleaseDownload.allowedRedirect(URL(string: "https://release-assets.githubusercontent.com/a?signature=test")))
+    precondition(UpdateStaging.safeEntry("Stan Mic Bridge.app/Contents/MacOS/StanMicBridge"))
+    precondition(UpdateStaging.receiptRootName("StanMicBridge-update-" + UUID().uuidString))
+    precondition(!UpdateStaging.receiptRootName("StanMicBridge-update-../../other"))
+    precondition(!UpdateStaging.receiptRootName("Other-" + UUID().uuidString))
+    for bad in ["../Stan Mic Bridge.app/x", "/Stan Mic Bridge.app/x", "Stan Mic Bridge.app/../x", "Stan Mic Bridge.app/a\\b", "Other.app/x"] {
+        precondition(!UpdateStaging.safeEntry(bad))
     }
     print("Update and microphone authorization policy checks passed")
 }
@@ -218,7 +390,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let updateItem = NSMenuItem(title: "檢查更新…", action: #selector(checkUpdates), keyEquivalent: "")
     private var updateSession: URLSession?
     private var updatePanel: NSPanel?
-    private var releaseURL: URL?
+    private var offeredRelease: PublicRelease?
+    private var installingUpdate = false
+    private var installerHandoff = false
+    private var stagingRoot: URL?
     private var connection: Connection?
     private var enabled = false
     private var sleeping = false
@@ -263,6 +438,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.button?.image = image
             statusItem.button?.imagePosition = .imageLeading
         }
+        // Confirm menu construction before Keychain access can display a system prompt.
+        UpdateStaging.acknowledgeStartup()
         connection = Credentials.load()
         show(connection == nil ? "請先設定連線" : "已停止")
         let center = NSWorkspace.shared.notificationCenter
@@ -295,7 +472,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func checkUpdates() {
-        guard updateSession == nil else { return }
+        guard updateSession == nil, !installingUpdate else { return }
         updateItem.isEnabled = false
         updateItem.title = "正在檢查更新…"
         let configuration = URLSessionConfiguration.ephemeral
@@ -339,7 +516,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.showUpdate("無法檢查更新", "GitHub 回應不完整或服務暫時無法使用，請稍後再試。")
                     return
                 }
-                guard let latest = release.stableVersion, let url = release.trustedURL else {
+                guard let latest = release.stableVersion, release.trustedURL != nil else {
                     self.showUpdate("沒有可用的正式更新", "收到的版本或發布網址無法確認；不會開啟或安裝此更新。")
                     return
                 }
@@ -354,15 +531,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 let rawNotes = release.body ?? "此版本未提供更新說明。"
                 let notes = String(rawNotes.prefix(6000)) + (rawNotes.count > 6000 ? "\n…完整說明請查看發布頁面。" : "")
-                self.showUpdate("有新版本可用", "目前版本：\(currentText)\n最新版本：\(release.tag_name)\n\n\(notes)\n\n按下方按鈕只會開啟 GitHub 發布頁面。請自行下載及執行安裝；安裝前先停止傳送並結束程式。", url: url)
+                guard release.installAsset != nil else {
+                    self.showUpdate("新版尚未準備完成", "最新版本：\(release.tag_name)\n\n此版本尚未提供可驗證的 App 安裝包，請稍後重新檢查。")
+                    return
+                }
+                self.showUpdate("有新版本可用", "目前版本：\(currentText)\n最新版本：\(release.tag_name)\n\n\(notes)\n\n下載與驗證時可繼續收音。安裝時會停止傳送並重新開啟 App；重開後請手動開始傳送。連線設定會保留。", release: release)
             }
         }.resume()
     }
 
     // A modeless panel leaves the audio run loop running while release notes are read.
-    private func showUpdate(_ title: String, _ detail: String, url: URL? = nil) {
+    private func showUpdate(_ title: String, _ detail: String, release: PublicRelease? = nil) {
         updatePanel?.close()
-        releaseURL = url
+        offeredRelease = release
         let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 540, height: 390),
                             styleMask: [.titled, .closable], backing: .buffered, defer: false)
         panel.title = title
@@ -383,8 +564,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         close.frame = NSRect(x: 430, y: 20, width: 90, height: 30)
         close.bezelStyle = .rounded
         panel.contentView?.addSubview(close)
-        if url != nil {
-            let open = NSButton(title: "查看更新與安裝", target: self, action: #selector(openRelease))
+        if release != nil {
+            let open = NSButton(title: "下載並安裝更新", target: self, action: #selector(installUpdate))
             open.frame = NSRect(x: 20, y: 20, width: 180, height: 30)
             open.bezelStyle = .rounded
             panel.contentView?.addSubview(open)
@@ -396,11 +577,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func closeUpdatePanel() { updatePanel?.close() }
-    @objc private func openRelease() {
-        guard let url = releaseURL else { return }
-        if !NSWorkspace.shared.open(url) {
-            showUpdate("無法開啟瀏覽器", "請稍後再試，或手動前往 github.com/Cherith1222/stan-mic-bridge/releases。")
+    @objc private func installUpdate() {
+        guard !installingUpdate, updateSession == nil, let release = offeredRelease,
+              let asset = release.installAsset, let url = URL(string: asset.browser_download_url) else { return }
+        let destination = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications/Stan Mic Bridge.app")
+        guard Bundle.main.bundleURL.standardizedFileURL == destination.standardizedFileURL,
+              Bundle.main.bundleURL.resolvingSymlinksInPath() == destination.standardizedFileURL else {
+            showUpdate("請先安裝 App", "請將 Stan Mic Bridge.app 放到個人 Applications 資料夾後重新開啟，再使用 App 內更新。")
+            return
         }
+        let helper = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/StanMicUpdater")
+        guard FileManager.default.isExecutableFile(atPath: helper.path) else {
+            showUpdate("此安裝缺少更新元件", "請從正式發布頁下載完整 App，使用 Finder 安裝一次後即可使用 App 內更新。")
+            return
+        }
+        installingUpdate = true
+        updateItem.isEnabled = false
+        updateItem.title = "正在下載更新…"
+        showUpdate("正在下載更新", "下載與驗證完成後會安裝並重新開啟 App。這段期間仍可傳送麥克風；結束 App 可取消下載。")
+        let downloader = ReleaseDownload(size: asset.size)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.urlCredentialStorage = nil
+        configuration.urlCache = nil
+        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForResource = 300
+        let client = URLSession(configuration: configuration, delegate: downloader, delegateQueue: nil)
+        updateSession = client
+        downloader.progress = { [weak self] percent in
+            DispatchQueue.main.async { self?.updateItem.title = "正在下載更新 \(percent)%…" }
+        }
+        downloader.completion = { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.updateSession = nil
+                guard case .success(let data) = result else { self.updateFailed(); return }
+                self.updateItem.title = "正在驗證更新…"
+                let root = FileManager.default.temporaryDirectory.appendingPathComponent("StanMicBridge-update-" + UUID().uuidString, isDirectory: true)
+                do { try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700]) }
+                catch { self.updateFailed(); return }
+                self.stagingRoot = root
+                DispatchQueue.global(qos: .utility).async {
+                    let staged = try? UpdateStaging.prepare(data, release: release, root: root)
+                    DispatchQueue.main.async {
+                        guard let staged = staged else { self.updateFailed(); return }
+                        let process = Process()
+                        process.executableURL = helper
+                        process.arguments = [String(ProcessInfo.processInfo.processIdentifier), staged.path, destination.path]
+                        do { try process.run() }
+                        catch { self.updateFailed(); return }
+                        self.installerHandoff = true
+                        self.stop()
+                        NSApp.terminate(nil)
+                    }
+                }
+            }
+        }
+        client.dataTask(with: url).resume()
+    }
+
+    private func updateFailed() {
+        if let root = stagingRoot { try? FileManager.default.removeItem(at: root) }
+        stagingRoot = nil
+        installingUpdate = false
+        updateItem.title = "檢查更新…"
+        updateItem.isEnabled = true
+        showUpdate("更新未完成", "無法下載、驗證或準備更新。原本的 App 與連線設定沒有變更，麥克風可繼續使用。請稍後重新檢查更新。")
     }
 
     @objc private func configure() {
@@ -714,6 +957,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         stop()
         updateSession?.invalidateAndCancel()
+        if !installerHandoff, let root = stagingRoot { try? FileManager.default.removeItem(at: root) }
         for observer in workspaceObservers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
     }
 }
@@ -721,6 +965,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 if CommandLine.arguments.contains("--test-updates") {
     testUpdatePolicy()
     exit(0)
+}
+
+// CI validates the exact release ZIP using the same staging path as the UI.
+if CommandLine.arguments.count == 5, CommandLine.arguments[1] == "--test-update-package" {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("StanMicBridge-update-" + UUID().uuidString)
+    do {
+        let archive = URL(fileURLWithPath: CommandLine.arguments[2])
+        let tag = CommandLine.arguments[3]
+        let size = try archive.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        var release = PublicRelease(tag_name: tag,
+            html_url: "https://github.com/Cherith1222/stan-mic-bridge/releases/tag/" + tag,
+            body: nil, draft: false, prerelease: false)
+        release.assets = [.init(name: "StanMicBridge-macOS.zip",
+            browser_download_url: "https://github.com/Cherith1222/stan-mic-bridge/releases/download/" + tag + "/StanMicBridge-macOS.zip",
+            digest: "sha256:" + CommandLine.arguments[4], size: size)]
+        guard release.installAsset != nil else { throw InstallFailure.invalid }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        _ = try UpdateStaging.prepare(Data(contentsOf: archive), release: release, root: root)
+        try FileManager.default.removeItem(at: root)
+        print("Update package validation passed")
+        exit(0)
+    } catch {
+        try? FileManager.default.removeItem(at: root)
+        print("Update package validation failed")
+        exit(1)
+    }
 }
 
 let app = NSApplication.shared

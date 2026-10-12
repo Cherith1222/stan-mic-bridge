@@ -22,23 +22,8 @@ fi
 stage="$(mktemp -d "${TMPDIR:-/tmp}/stan-mic-build.XXXXXX")"
 trap 'rm -rf -- "$stage"' EXIT
 app="$stage/Stan Mic Bridge.app"
-mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$HOME/Applications"
-cp Info.plist "$app/Contents/Info.plist"
-plutil -lint "$app/Contents/Info.plist"
-arch="$(uname -m)"
-case "$arch" in arm64|x86_64) ;; *) echo 'Unsupported Mac architecture.' >&2; exit 1 ;; esac
-echo 'Building the native menu bar app with Apple Swift…'
-xcrun swiftc -swift-version 5 -O -target "${arch}-apple-macosx12.0" \
-  -framework AppKit -framework AVFoundation -framework Security \
-  StanMicBridge.swift -o "$app/Contents/MacOS/StanMicBridge"
-echo 'Generating the application icon…'
-xcrun swiftc -swift-version 5 -O -target "${arch}-apple-macosx12.0" \
-  -framework AppKit GenerateIcon.swift -o "$stage/GenerateIcon"
-"$stage/GenerateIcon" "$stage/AppIcon.iconset"
-iconutil --convert icns "$stage/AppIcon.iconset" --output "$app/Contents/Resources/AppIcon.icns"
-[[ -s "$app/Contents/Resources/AppIcon.icns" ]] || { echo 'App icon generation failed.' >&2; exit 1; }
-codesign --force --sign - --identifier com.stan.micbridge "$app"
-codesign --verify --strict --verbose=2 "$app"
+mkdir -p "$HOME/Applications"
+bash build-app.command "$stage"
 destination="$HOME/Applications/Stan Mic Bridge.app"
 if [[ -e "$destination" ]]; then
   backup="$HOME/Applications/Stan Mic Bridge.backup.$(date +%Y%m%d-%H%M%S).app"

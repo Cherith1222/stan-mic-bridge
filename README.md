@@ -16,7 +16,7 @@ Windows receiver → VB-CABLE → Windows default microphone → your app
 - App icon for Finder/login items and a microphone symbol in the menu bar.
 - Close Chrome and Terminal while the menu bar app keeps running.
 - Save the connection once in macOS Keychain; no repeated token entry.
-- Manually check GitHub releases from the menu, then choose whether to open the update instructions.
+- Check GitHub releases from the menu and choose to download/install inside the app.
 - Convert microphone audio to 48 kHz mono Float32 with bounded buffering.
 - Switch Windows default microphone roles on first audio, then restore them when the session ends.
 - Browser sender included as an alternative; its tab must remain open.
@@ -24,7 +24,7 @@ Windows receiver → VB-CABLE → Windows default microphone → your app
 
 ## Requirements
 
-**Mac:** macOS 12+, Apple Command Line Tools (`xcode-select --install`), and Tailscale. The installer builds for the Mac's current architecture; it does not download a prebuilt binary.
+**Mac:** macOS 12+ and Tailscale. A universal prebuilt app supports Intel and Apple Silicon. Apple Command Line Tools (`xcode-select --install`) are needed only for the optional source build.
 
 **Windows:** Python 3.12 is the reference runtime, [VB-CABLE](https://vb-audio.com/Cable/), and [Tailscale](https://tailscale.com/download). Install the virtual audio driver using its official installer and follow its reboot instructions. Select a working physical microphone as the Windows default before setup. The virtual endpoint must be named `CABLE Output (VB-Audio Virtual Cable)`.
 
@@ -72,7 +72,9 @@ Set the shortcut's **Start in** to the repository folder. This project does not 
 
 ## 2. Install the native Mac app
 
-Clone or download this repository on your Mac, then run:
+Download **StanMicBridge-macOS.zip** from the [latest release](https://github.com/Cherith1222/stan-mic-bridge/releases/latest), extract it, and move **Stan Mic Bridge.app** into `~/Applications`. In Finder, Command+Shift+G opens that folder. Quit an older running version before replacing it. Launch the installed app. The prebuilt app is ad-hoc signed, not Developer ID notarized; if macOS blocks it, review the app's origin and use the system's per-app approval in **Privacy & Security → Open Anyway**. No security settings are changed by the app. [Apple's explanation](https://support.apple.com/102445).
+
+Alternatively, clone or download this repository and build locally:
 
 ```bash
 bash mac/install.command
@@ -102,9 +104,11 @@ This opens the menu bar app after login. **Each new launch starts stopped; click
 
 Choose **檢查更新…** (Check for updates) in the Mic menu. The app contacts this project's public GitHub Releases API only when clicked, compares the latest stable version, and displays its release notes. Checking does not stop recording and does not send your microphone connection credentials to GitHub.
 
-For a newer version, choose **查看更新與安裝** to open its release page. Download `StanMicBridge-source.zip`, quit the existing app, extract the archive, and run `bash StanMicBridge/install.command` from the extracted parent folder. Installation is manual; the app never downloads or executes an updater in the background. The installer preserves an older app as a backup and keeps the same bundle identifier and Keychain service. Your saved connection stays in Keychain, though macOS can ask you to authorize access again after rebuilding.
+For a newer version, choose **下載並安裝更新** (Download and install update). The app downloads the prebuilt ZIP, verifies the GitHub-provided SHA-256 digest, archive structure, bundle identity/version, and code signature, then stops transmission, installs, and reopens stopped. There is no Terminal or local compilation involved. Downloads and validation leave existing transmission running; quitting the app before installation cancels the update. Only installation at `~/Applications/Stan Mic Bridge.app` is supported.
 
-Version 1.0.0 has no update menu, so upgrade it once with the release installer. There are no scheduled checks, silent installations, or automatic recording after updates.
+An independent helper waits for the old app to exit, preserves its bundle as a backup, and verifies that the new app reaches its UI startup checkpoint. Replacement and startup failures trigger restoration where safe; if an unresponsive new process cannot be stopped, the helper leaves the backup intact and explains how to restore it instead of modifying a running app. Startup readiness does not prove microphone or network functionality. The helper does not touch Keychain, so connection data is retained. macOS may ask again for microphone or Keychain authorization after an update.
+
+Versions before 1.2.0 need one manual upgrade (Finder replacement or source installer) before in-app installation is available. There are no scheduled checks, silent installations, or automatic recording after updates. Missing or invalid release assets are refused rather than installed.
 
 ## Browser alternative
 
@@ -117,7 +121,7 @@ Open the same private pairing link in a microphone-capable browser, press Start,
 - A different microphone manually selected during a session is preserved when restoring.
 - All three Windows default capture roles change while forwarding. Some applications cache their device and need recording restarted.
 - The native sender currently has no acoustic echo cancellation or noise suppression. Headphones help prevent the remote speaker output from re-entering the microphone.
-- Mac UI is currently Traditional Chinese. There is no notarized binary; updates use a source installer and Apple Command Line Tools.
+- Mac UI is currently Traditional Chinese. Prebuilt binaries are ad-hoc signed, not Developer ID notarized.
 - Devices producing very large audio batches can lose older samples under the low-latency queue limit.
 
 ## Verification
