@@ -68,7 +68,7 @@ private func replace(destination: URL, incoming: URL, backup: URL,
             }
             try move(backup, destination)
         } catch {
-            throw UpdateError.message("Update failed and automatic restoration could not finish. Your original app is preserved at \(backup.path). Move it back to \(destination.path).")
+            throw UpdateError.message("Update failed and automatic restoration could not finish: \(error) Your original app is preserved at \(backup.path). After quitting the app, move the backup back to \(destination.path).")
         }
         throw UpdateError.message("Update failed. Your original app was restored: \(originalError)")
     }
@@ -102,12 +102,25 @@ private func matchingLaunch(_ app: NSRunningApplication, destination: URL, since
 private func stopFailedLaunch(destination: URL, since: Date) throws {
     let candidates = NSRunningApplication.runningApplications(withBundleIdentifier: "com.stan.micbridge")
         .filter { matchingLaunch($0, destination: destination, since: since) }
-    for app in candidates where !app.isTerminated { _ = app.terminate() }
+    var refusedTermination = false
+    for app in candidates where !app.isTerminated {
+        if !app.terminate() { refusedTermination = true }
+    }
     let deadline = ProcessInfo.processInfo.systemUptime + 10
-    while candidates.contains(where: { !$0.isTerminated && kill($0.processIdentifier, 0) == 0 }) {
+    while candidates.contains(where: { candidate in
+        guard kill(candidate.processIdentifier, 0) == 0,
+              let current = NSRunningApplication(processIdentifier: candidate.processIdentifier) else { return false }
+        return !current.isTerminated && matchingLaunch(current, destination: destination, since: since)
+    }) {
         try require(ProcessInfo.processInfo.systemUptime < deadline,
-                    "The newly launched app could not be stopped safely. The original backup was retained.")
-        Thread.sleep(forTimeInterval: 0.1)
+                    refusedTermination
+                        ? "The newly launched app refused normal termination, possibly because a permission or setup dialog is open. Close that dialog and quit the app. The original backup was retained."
+                        : "The newly launched app did not finish quitting within 10 seconds. Close any permission or setup dialog and quit the app. The original backup was retained.")
+        // NSRunningApplication state changes are delivered through the run loop.
+        // Sleeping alone can leave its cached state stale in this command-line helper.
+        if !RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1)) {
+            Thread.sleep(forTimeInterval: 0.1)
+        }
     }
     // Never move a bundle still used by any app, including a simultaneous manual launch.
     let stillRunning = NSRunningApplication.runningApplications(withBundleIdentifier: "com.stan.micbridge")
@@ -266,7 +279,7 @@ private func testStartup(_ path: String) throws {
     let receipt = root.appendingPathComponent("update-ready.json")
     let started = Date()
     do {
-        try run("/usr/bin/open", ["-n", app.path, "--args", "--update-ready", receipt.path])
+        try run("/usr/bin/open", ["-n", app.path, "--args", "--test-update-startup", receipt.path])
         try waitForReadiness(receipt: receipt, build: String(build), alive: { pid in
             guard kill(pid, 0) == 0, let running = NSRunningApplication(processIdentifier: pid) else { return false }
             return matchingLaunch(running, destination: app, since: started)

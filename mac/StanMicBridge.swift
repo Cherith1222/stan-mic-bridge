@@ -180,13 +180,17 @@ private final class ReleaseDownload: NSObject, URLSessionDataDelegate {
 }
 
 private enum UpdateStaging {
+    static var isStartupTest: Bool {
+        CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--test-update-startup"
+    }
     static func receiptRootName(_ name: String) -> Bool {
         let prefix = "StanMicBridge-update-"
         return name.hasPrefix(prefix) && UUID(uuidString: String(name.dropFirst(prefix.count))) != nil
     }
     static func acknowledgeStartup() {
         let arguments = CommandLine.arguments
-        guard arguments.count == 3, arguments[1] == "--update-ready" else { return }
+        guard arguments.count == 3,
+              arguments[1] == "--update-ready" || isStartupTest else { return }
         let receipt = URL(fileURLWithPath: arguments[2]).standardizedFileURL
         let root = receipt.deletingLastPathComponent()
         let temporary = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().standardizedFileURL
@@ -440,7 +444,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // Confirm menu construction before Keychain access can display a system prompt.
         UpdateStaging.acknowledgeStartup()
-        connection = Credentials.load()
+        // The explicit UI smoke-test mode exercises the real menu and receipt
+        // without requiring a CI login Keychain or blocking on onboarding.
+        connection = UpdateStaging.isStartupTest ? nil : Credentials.load()
         show(connection == nil ? "請先設定連線" : "已停止")
         let center = NSWorkspace.shared.notificationCenter
         workspaceObservers.append(center.addObserver(forName: NSWorkspace.willSleepNotification,
@@ -456,7 +462,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.sleeping = false
             if self.enabled { self.scheduleRetry(message: "已喚醒，準備重連") }
         })
-        if connection == nil { DispatchQueue.main.async { self.configure() } }
+        if connection == nil && !UpdateStaging.isStartupTest { DispatchQueue.main.async { self.configure() } }
     }
 
     private func show(_ text: String) {
