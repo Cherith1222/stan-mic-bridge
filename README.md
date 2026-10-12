@@ -102,7 +102,7 @@ This opens the menu bar app after login. **Normal launches, including login and 
 
 ### Check for updates
 
-Choose **檢查更新…** (Check for updates) in the Mic menu. The app contacts this project's public GitHub Releases API only when clicked, compares the latest stable version, and displays its release notes. Checking does not stop recording and does not send your microphone connection credentials to GitHub.
+The Mic menu shows the installed version. Choose **檢查更新…** (Check for updates) to check independently of microphone transmission. The menu displays the result directly; when a newer version is available, it offers installation and a separate release-notes action. The app contacts this project's public GitHub Releases API only when clicked. Checking does not stop recording and does not send your microphone connection credentials to GitHub.
 
 For a newer version, choose **下載並安裝更新** (Download and install update). The app downloads the prebuilt ZIP, verifies the GitHub-provided SHA-256 digest, archive structure, bundle identity/version, and code signature, then stops transmission, installs, and reopens. By default it reopens stopped. There is no Terminal or local compilation involved. Downloads and validation leave existing transmission running; quitting the app before installation cancels the update. Only installation at `~/Applications/Stan Mic Bridge.app` is supported.
 
@@ -111,6 +111,8 @@ Starting in 1.2.2, **更新後自動恢復傳送** (Resume transmission after up
 An independent helper waits for the old app to exit, preserves its bundle as a backup, and verifies that the new app reaches its UI startup checkpoint. Replacement and startup failures trigger restoration where safe; if an unresponsive new process cannot be stopped, the helper leaves the backup intact and explains how to restore it instead of modifying a running app. Startup readiness does not prove microphone or network functionality. The helper does not touch Keychain, so connection data is retained. macOS may ask again for microphone or Keychain authorization after an update.
 
 Versions before 1.2.0 need one manual upgrade (Finder replacement or source installer) before in-app installation is available. There are no scheduled checks or silent installations. Automatic transmission after an update requires the explicit option and the conditions above. Missing or invalid release assets are refused rather than installed.
+
+**Recovery from the 1.2.0–1.2.2 symbolic-link error:** those versions' installed update helper can mistake macOS's normal `/var` alias for an unsafe installation path. The failure occurs before replacing the installed app. Install 1.2.3 or newer once through the source installer or manual app replacement to activate the repaired helper; retrying the old in-app updater cannot replace that helper. Version 1.2.3 canonicalizes only OS-provided home/temp anchors and still rejects symbolic links within the installation and staging directories.
 
 ### Signing identity and repeated permission prompts
 

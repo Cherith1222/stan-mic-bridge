@@ -179,6 +179,32 @@ private final class ReleaseDownload: NSObject, URLSessionDataDelegate {
     }
 }
 
+private enum UpdatePaths {
+    // Resolve only OS-provided anchors. Foundation's URL standardization may
+    // rewrite /private/var back to /var, so keep the canonical POSIX spelling.
+    static func canonicalAnchor(_ anchor: URL) -> String? {
+        guard let pointer = realpath(anchor.path, nil) else { return nil }
+        defer { free(pointer) }
+        return String(cString: pointer)
+    }
+    static func matches(_ candidate: String, relative: String, anchor: URL) -> Bool {
+        guard let canonical = canonicalAnchor(anchor) else { return false }
+        let raw = anchor.path.hasSuffix("/") ? String(anchor.path.dropLast()) : anchor.path
+        return candidate == raw + "/" + relative || candidate == canonical + "/" + relative
+    }
+    static func existing(_ relative: String, anchor: URL) -> URL? {
+        let components = relative.split(separator: "/", omittingEmptySubsequences: false)
+        guard !components.isEmpty, components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }),
+              var path = canonicalAnchor(anchor) else { return nil }
+        for component in components {
+            path += "/" + component
+            var info = stat()
+            guard lstat(path, &info) == 0, info.st_mode & mode_t(S_IFMT) != mode_t(S_IFLNK) else { return nil }
+        }
+        return URL(fileURLWithPath: path)
+    }
+}
+
 private enum UpdateResume {
     static let preferenceKey = "resumeTransmissionAfterUpdate"
     struct Intent: Codable { let parentPID: Int32; let build: String; let createdAt: Double }
@@ -229,17 +255,19 @@ private enum UpdateStaging {
         guard (arguments.count == 3 || (arguments.count == 5 && arguments[3] == "--resume-update")),
               arguments[1] == "--update-ready" || (arguments.count == 3 && arguments[1] == "--test-update-startup")
                 || (arguments.count == 5 && arguments[1] == "--test-update-resume") else { return nil }
-        let receipt = URL(fileURLWithPath: arguments[2]).standardizedFileURL
-        let root = receipt.deletingLastPathComponent()
-        let temporary = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().standardizedFileURL
-        guard receipt.lastPathComponent == "update-ready.json", receiptRootName(root.lastPathComponent),
-              root.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL == temporary,
-              root.resolvingSymlinksInPath() == temporary.appendingPathComponent(root.lastPathComponent, isDirectory: true),
+        let requested = URL(fileURLWithPath: arguments[2])
+        let rootName = requested.deletingLastPathComponent().lastPathComponent
+        let temporary = FileManager.default.temporaryDirectory
+        guard requested.lastPathComponent == "update-ready.json", receiptRootName(rootName),
+              UpdatePaths.matches(arguments[2], relative: rootName + "/update-ready.json", anchor: temporary),
+              let root = UpdatePaths.existing(rootName, anchor: temporary),
               let attributes = try? FileManager.default.attributesOfItem(atPath: root.path),
               attributes[.type] as? FileAttributeType == .typeDirectory,
               (attributes[.ownerAccountID] as? NSNumber)?.uint32Value == geteuid(),
-              (attributes[.posixPermissions] as? NSNumber)?.intValue == 0o700,
-              (try? FileManager.default.attributesOfItem(atPath: receipt.path)) == nil else { return nil }
+              (attributes[.posixPermissions] as? NSNumber)?.intValue == 0o700 else { return nil }
+        let receipt = root.appendingPathComponent("update-ready.json")
+        var receiptInfo = stat()
+        guard lstat(receipt.path, &receiptInfo) != 0, errno == ENOENT else { return nil }
         return receipt
     }
     static func acknowledgeStartup(resumeGranted: Bool) {
@@ -341,6 +369,21 @@ private func testUpdatePolicy() {
         let grantFile = root.appendingPathComponent("resume-once.json")
         let nonce = String(repeating: "a", count: 64)
         let arguments = ["app", "--update-ready", root.appendingPathComponent("update-ready.json").path, "--resume-update", nonce]
+        precondition(UpdatePaths.existing(root.lastPathComponent, anchor: FileManager.default.temporaryDirectory) != nil)
+        precondition(UpdateStaging.validReceipt(arguments: arguments) != nil)
+        if let canonical = UpdatePaths.canonicalAnchor(FileManager.default.temporaryDirectory) {
+            var canonicalArguments = arguments
+            canonicalArguments[2] = canonical + "/" + root.lastPathComponent + "/update-ready.json"
+            precondition(UpdateStaging.validReceipt(arguments: canonicalArguments) != nil)
+        } else { preconditionFailure("Cannot resolve the current user's temporary anchor") }
+        let linkedRoot = FileManager.default.temporaryDirectory.appendingPathComponent("StanMicBridge-update-" + UUID().uuidString)
+        try FileManager.default.createSymbolicLink(at: linkedRoot, withDestinationURL: root)
+        defer { try? FileManager.default.removeItem(at: linkedRoot) }
+        var linkedArguments = arguments
+        linkedArguments[2] = linkedRoot.appendingPathComponent("update-ready.json").path
+        precondition(UpdateStaging.validReceipt(arguments: linkedArguments) == nil)
+        precondition(UpdatePaths.existing(linkedRoot.lastPathComponent, anchor: FileManager.default.temporaryDirectory) == nil)
+        precondition(UpdatePaths.existing("../" + root.lastPathComponent, anchor: FileManager.default.temporaryDirectory) == nil)
         func seed(build: String = "6", timestamp: Double = 1000) throws {
             try JSONEncoder().encode(UpdateResume.Grant(build: build, createdAt: timestamp, nonce: nonce)).write(to: grantFile)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: grantFile.path)
@@ -474,6 +517,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let configureItem = NSMenuItem(title: "設定連線…", action: #selector(configure), keyEquivalent: "")
     private let forgetItem = NSMenuItem(title: "清除已儲存的連線…", action: #selector(forget), keyEquivalent: "")
     private let updateItem = NSMenuItem(title: "檢查更新…", action: #selector(checkUpdates), keyEquivalent: "")
+    private let versionItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let updateStatusItem = NSMenuItem(title: "尚未檢查更新", action: nil, keyEquivalent: "")
+    private let installUpdateItem = NSMenuItem(title: "下載並安裝更新…", action: #selector(confirmUpdate), keyEquivalent: "")
+    private let releaseHistoryItem = NSMenuItem(title: "查看版本紀錄…", action: #selector(openReleaseHistory), keyEquivalent: "")
     private let resumeUpdateItem = NSMenuItem(title: "更新後自動恢復傳送", action: #selector(toggleUpdateResume), keyEquivalent: "")
     private var updateSession: URLSession?
     private var updatePanel: NSPanel?
@@ -513,8 +560,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(item)
         }
         menu.addItem(.separator())
+        versionItem.title = "目前版本：" + (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "未知")
+        versionItem.isEnabled = false
+        updateStatusItem.isEnabled = false
+        menu.addItem(versionItem)
+        menu.addItem(updateStatusItem)
         updateItem.target = self
         menu.addItem(updateItem)
+        installUpdateItem.target = self
+        installUpdateItem.isHidden = true
+        menu.addItem(installUpdateItem)
+        releaseHistoryItem.target = self
+        menu.addItem(releaseHistoryItem)
         resumeUpdateItem.target = self
         resumeUpdateItem.state = UserDefaults.standard.bool(forKey: UpdateResume.preferenceKey) ? .on : .off
         menu.addItem(resumeUpdateItem)
@@ -571,7 +628,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stateItem.title = text
         stateItem.isEnabled = false
         statusItem.button?.title = ready ? "Mic ●" : (enabled ? "Mic …" : "Mic ○")
-        statusItem.button?.toolTip = "Stan Mic Bridge — " + text
+        statusItem.button?.toolTip = "Stan Mic Bridge — " + text + "\n" + versionItem.title + "\n" + updateStatusItem.title
         statusItem.button?.setAccessibilityLabel("Stan Mic Bridge — " + text)
         startItem.isEnabled = !enabled && connection != nil
         stopItem.isEnabled = enabled
@@ -581,8 +638,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func checkUpdates() {
         guard updateSession == nil, !installingUpdate else { return }
+        // A confirmation belongs to its displayed release; invalidate it before
+        // refreshing metadata so an old panel can never install a different tag.
+        updatePanel?.close()
         updateItem.isEnabled = false
         updateItem.title = "正在檢查更新…"
+        offeredRelease = nil
+        installUpdateItem.isHidden = true
+        setUpdateStatus("正在檢查更新…")
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 15
         configuration.timeoutIntervalForResource = 20
@@ -604,46 +667,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.updateItem.isEnabled = true
                 self.updateItem.title = "檢查更新…"
                 if error != nil {
-                    self.showUpdate("無法檢查更新", "連線逾時或網路暫時無法使用，請稍後再試。麥克風傳送不受影響。")
+                    self.setUpdateStatus("檢查失敗：網路無法使用，請重試")
                     return
                 }
                 guard let response = response as? HTTPURLResponse else {
-                    self.showUpdate("無法檢查更新", "GitHub 回應無法辨識，請稍後再試。")
+                    self.setUpdateStatus("檢查失敗：無法辨識回應")
                     return
                 }
                 if response.statusCode == 404 {
-                    self.showUpdate("尚無可用版本", "GitHub 目前沒有可取得的正式發布版本。你可以繼續使用目前版本。")
+                    self.setUpdateStatus("目前尚無正式發布版本")
                     return
                 }
                 if response.statusCode == 403 || response.statusCode == 429 {
-                    self.showUpdate("GitHub 暫時限制請求", "可能已達公開 API 的請求限制，或 GitHub 拒絕此請求。請稍後再手動檢查。")
+                    self.setUpdateStatus("GitHub 暫時限制請求，請稍後重試")
                     return
                 }
                 guard response.statusCode == 200, let data = data, data.count <= 1048576,
                       let release = try? JSONDecoder().decode(PublicRelease.self, from: data) else {
-                    self.showUpdate("無法檢查更新", "GitHub 回應不完整或服務暫時無法使用，請稍後再試。")
+                    self.setUpdateStatus("檢查失敗：發布資料不完整")
                     return
                 }
                 guard let latest = release.stableVersion, release.trustedURL != nil else {
-                    self.showUpdate("沒有可用的正式更新", "收到的版本或發布網址無法確認；不會開啟或安裝此更新。")
+                    self.setUpdateStatus("沒有可驗證的正式更新")
                     return
                 }
                 let currentText = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "未知"
                 guard let current = StableVersion(currentText) else {
-                    self.showUpdate("無法判斷目前版本", "請到 GitHub 的正式發布頁面確認目前的安裝版本。")
+                    self.setUpdateStatus("無法判斷目前版本，請查看版本紀錄")
                     return
                 }
                 guard latest > current else {
-                    self.showUpdate("已是最新版本", "目前版本：\(currentText)\n最新正式版本：\(release.tag_name)")
+                    self.setUpdateStatus("已是最新版本（\(currentText)）")
                     return
                 }
-                let rawNotes = release.body ?? "此版本未提供更新說明。"
-                let notes = String(rawNotes.prefix(6000)) + (rawNotes.count > 6000 ? "\n…完整說明請查看發布頁面。" : "")
                 guard release.installAsset != nil else {
-                    self.showUpdate("新版尚未準備完成", "最新版本：\(release.tag_name)\n\n此版本尚未提供可驗證的 App 安裝包，請稍後重新檢查。")
+                    self.setUpdateStatus("\(release.tag_name) 安裝包尚未準備完成")
                     return
                 }
-                self.showUpdate("有新版本可用", "目前版本：\(currentText)\n最新版本：\(release.tag_name)\n\n\(notes)\n\n下載與驗證時可繼續收音。安裝時會停止傳送並重新開啟 App。\(self.updateResumeDescription)連線設定會保留。", release: release)
+                self.offeredRelease = release
+                self.installUpdateItem.title = "下載並安裝 \(release.tag_name)…"
+                self.installUpdateItem.isEnabled = true
+                self.installUpdateItem.isHidden = false
+                self.setUpdateStatus("有更新可用：\(release.tag_name)")
             }
         }.resume()
     }
@@ -651,7 +716,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // A modeless panel leaves the audio run loop running while release notes are read.
     private func showUpdate(_ title: String, _ detail: String, release: PublicRelease? = nil) {
         updatePanel?.close()
-        offeredRelease = release
         let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 540, height: 390),
                             styleMask: [.titled, .closable], backing: .buffered, defer: false)
         panel.title = title
@@ -685,6 +749,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func closeUpdatePanel() { updatePanel?.close() }
+    private func setUpdateStatus(_ text: String) {
+        updateStatusItem.title = text
+        statusItem.button?.toolTip = "Stan Mic Bridge — " + stateItem.title + "\n" + versionItem.title + "\n" + text
+    }
+    @objc private func openReleaseHistory() {
+        let url = URL(string: "https://github.com/Cherith1222/stan-mic-bridge/releases")!
+        if !NSWorkspace.shared.open(url) { setUpdateStatus("無法開啟版本紀錄，請重試") }
+    }
+    @objc private func confirmUpdate() {
+        guard !installingUpdate, updateSession == nil, let release = offeredRelease else { return }
+        showUpdate("安裝 \(release.tag_name)？", "\(versionItem.title)\n更新版本：\(release.tag_name)\n\n下載與驗證時可繼續收音。安裝時會停止傳送並重新開啟 App。\(updateResumeDescription)\n\n連線設定會保留。", release: release)
+    }
     private var updateResumeDescription: String {
         if UserDefaults.standard.bool(forKey: UpdateResume.preferenceKey) {
             return "已啟用更新後恢復：只有安裝前仍在傳送且權限有效時才會恢復。下載時按停止或取消勾選即可取消恢復。"
@@ -697,16 +773,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         resumeUpdateItem.state = enabled ? .on : .off
         if installingUpdate {
             showUpdate("更新進行中", "下載與驗證尚未完成。" + updateResumeDescription)
-        } else if let release = offeredRelease {
-            showUpdate("有新版本可用", "最新版本：\(release.tag_name)\n\n\(String((release.body ?? "").prefix(6000)))\n\n" + updateResumeDescription, release: release)
+        } else if updatePanel?.isVisible == true && offeredRelease != nil {
+            confirmUpdate()
         }
     }
     @objc private func installUpdate() {
         guard !installingUpdate, updateSession == nil, let release = offeredRelease,
               let asset = release.installAsset, let url = URL(string: asset.browser_download_url) else { return }
-        let destination = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications/Stan Mic Bridge.app")
-        guard Bundle.main.bundleURL.standardizedFileURL == destination.standardizedFileURL,
-              Bundle.main.bundleURL.resolvingSymlinksInPath() == destination.standardizedFileURL else {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let relativeApp = "Applications/Stan Mic Bridge.app"
+        guard UpdatePaths.matches(Bundle.main.bundleURL.path, relative: relativeApp, anchor: home),
+              let destination = UpdatePaths.existing(relativeApp, anchor: home) else {
             showUpdate("請先安裝 App", "請將 Stan Mic Bridge.app 放到個人 Applications 資料夾後重新開啟，再使用 App 內更新。")
             return
         }
@@ -717,7 +794,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         installingUpdate = true
         updateItem.isEnabled = false
+        installUpdateItem.isEnabled = false
         updateItem.title = "正在下載更新…"
+        setUpdateStatus("正在下載更新…")
         showUpdate("正在下載更新", "下載與驗證完成後會安裝並重新開啟 App。這段期間仍可傳送麥克風；結束 App 可取消下載。" + updateResumeDescription)
         let downloader = ReleaseDownload(size: asset.size)
         let configuration = URLSessionConfiguration.ephemeral
@@ -730,7 +809,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let client = URLSession(configuration: configuration, delegate: downloader, delegateQueue: nil)
         updateSession = client
         downloader.progress = { [weak self] percent in
-            DispatchQueue.main.async { self?.updateItem.title = "正在下載更新 \(percent)%…" }
+            DispatchQueue.main.async {
+                self?.updateItem.title = "正在下載更新 \(percent)%…"
+                self?.setUpdateStatus("正在下載更新 \(percent)%…")
+            }
         }
         downloader.completion = { [weak self] result in
             DispatchQueue.main.async {
@@ -738,7 +820,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.updateSession = nil
                 guard case .success(let data) = result else { self.updateFailed(); return }
                 self.updateItem.title = "正在驗證更新…"
-                let root = FileManager.default.temporaryDirectory.appendingPathComponent("StanMicBridge-update-" + UUID().uuidString, isDirectory: true)
+                self.setUpdateStatus("正在驗證更新…")
+                guard let temporary = UpdatePaths.canonicalAnchor(FileManager.default.temporaryDirectory) else { self.updateFailed(); return }
+                let root = URL(fileURLWithPath: temporary).appendingPathComponent("StanMicBridge-update-" + UUID().uuidString, isDirectory: true)
                 do { try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700]) }
                 catch { self.updateFailed(); return }
                 self.stagingRoot = root
@@ -774,6 +858,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installingUpdate = false
         updateItem.title = "檢查更新…"
         updateItem.isEnabled = true
+        installUpdateItem.isEnabled = offeredRelease != nil
+        setUpdateStatus("更新未完成，可重試或重新檢查")
         showUpdate("更新未完成", "無法下載、驗證或準備更新。原本的 App 與連線設定沒有變更，麥克風可繼續使用。請稍後重新檢查更新。")
     }
 

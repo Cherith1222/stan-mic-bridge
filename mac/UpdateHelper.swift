@@ -45,7 +45,8 @@ private func run(_ executable: String, _ arguments: [String]) throws {
     task.waitUntilExit()
     try require(task.terminationStatus == 0, "Validation or launch failed (\(URL(fileURLWithPath: executable).lastPathComponent)).")
 }
-private func noSymlinks(_ path: URL) throws {
+// Retained solely to reproduce the historical Foundation alias bug in CI.
+private func legacyNoSymlinks(_ path: URL) throws {
     var current = path.standardizedFileURL
     while current.path != "/" {
         let attributes = try files.attributesOfItem(atPath: current.path)
@@ -53,7 +54,76 @@ private func noSymlinks(_ path: URL) throws {
         current.deleteLastPathComponent()
     }
 }
-private func testPaths() throws {
+private func canonicalAnchor(_ anchor: URL) throws -> URL {
+    guard let resolved = realpath(anchor.path, nil) else {
+        throw UpdateError.message("The trusted update directory is unavailable: \(anchor.path)")
+    }
+    defer { free(resolved) }
+    return URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
+}
+private func trimmedPath(_ path: String) -> String {
+    var result = path
+    while result.count > 1 && result.hasSuffix("/") { result.removeLast() }
+    return result
+}
+// Only the OS-provided anchor may contain aliases such as /var -> /private/var.
+// Never resolve the candidate: that would hide a link in Applications or staging.
+private func noSymlinksUnderAnchor(_ candidate: URL, anchor: URL) throws -> URL {
+    let canonical = try canonicalAnchor(anchor)
+    let canonicalPath = trimmedPath(canonical.path)
+    let rawAnchor = trimmedPath(anchor.path)
+    let candidatePath = trimmedPath(candidate.path)
+    let spellings = [canonicalPath, rawAnchor].sorted { $0.count > $1.count }
+    guard let matched = spellings.first(where: { candidatePath.hasPrefix($0 + "/") }) else {
+        throw UpdateError.message("The app path is outside its trusted update directory.")
+    }
+    let components = candidatePath.dropFirst(matched.count + 1).split(separator: "/", omittingEmptySubsequences: false)
+    try require(!components.isEmpty && components.allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." },
+                "The app path contains an invalid path component.")
+    var current = canonicalPath
+    for (index, component) in components.enumerated() {
+        current += "/" + String(component)
+        var metadata = stat()
+        try require(lstat(current, &metadata) == 0, "An update path component is unavailable: \(current)")
+        let type = metadata.st_mode & mode_t(S_IFMT)
+        try require(type != mode_t(S_IFLNK), "A symbolic link was found below the trusted update directory: \(current)")
+        if index < components.count - 1 {
+            try require(type == mode_t(S_IFDIR), "An update path component is not a directory: \(current)")
+        }
+    }
+    return URL(fileURLWithPath: current)
+}
+private struct InstallationPaths {
+    let destination: URL
+    let staged: URL
+    let stagingRoot: URL
+    let temporary: URL
+}
+// Production and path-regression tests use the same preflight. Tests supply
+// private fixture anchors; install() always supplies OS home and temp anchors.
+private func installationPaths(destination: URL, staged: URL, home: URL, temporary: URL) throws -> InstallationPaths {
+    let checkedDestination = try noSymlinksUnderAnchor(destination, anchor: home)
+    let expected = try canonicalAnchor(home).appendingPathComponent("Applications/Stan Mic Bridge.app")
+    try require(checkedDestination.path == expected.path, "This updater only supports ~/Applications/Stan Mic Bridge.app.")
+    let checkedStage = try noSymlinksUnderAnchor(staged, anchor: temporary)
+    let checkedTemporary = try canonicalAnchor(temporary)
+    let expanded = checkedStage.deletingLastPathComponent()
+    let stagingRoot = expanded.deletingLastPathComponent()
+    let prefix = "StanMicBridge-update-"
+    try require(checkedStage.lastPathComponent == "Stan Mic Bridge.app"
+        && expanded.lastPathComponent == "expanded"
+        && stagingRoot.deletingLastPathComponent().path == checkedTemporary.path
+        && stagingRoot.lastPathComponent.hasPrefix(prefix)
+        && UUID(uuidString: String(stagingRoot.lastPathComponent.dropFirst(prefix.count))) != nil,
+        "The updater staging directory has an unexpected layout.")
+    let attributes = try files.attributesOfItem(atPath: stagingRoot.path)
+    let owner = (attributes[.ownerAccountID] as? NSNumber)?.uint32Value
+    let mode = (attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0o777
+    try require(owner == geteuid() && mode & 0o077 == 0, "The update staging directory must be private to the current user.")
+    return InstallationPaths(destination: checkedDestination, staged: checkedStage,
+                             stagingRoot: stagingRoot, temporary: checkedTemporary)
+}
+private func testPaths(builtApp: URL? = nil) throws {
     let temporary = files.temporaryDirectory
     let fixture = temporary.appendingPathComponent("StanMicUpdater-path-test-\(UUID().uuidString)")
     try files.createDirectory(at: fixture, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
@@ -63,10 +133,86 @@ private func testPaths() throws {
     print("Standardized resolved anchor: \(temporary.resolvingSymlinksInPath().standardizedFileURL.path)")
     print("Home anchor: \(files.homeDirectoryForCurrentUser.path)")
     do {
-        try noSymlinks(fixture.resolvingSymlinksInPath())
+        try legacyNoSymlinks(fixture.resolvingSymlinksInPath())
         print("Legacy full-ancestor check accepted the real temporary fixture.")
     } catch {
         print("LEGACY PATH REPRODUCTION: \(error)")
+    }
+    let home = fixture.appendingPathComponent("home")
+    let destination = home.appendingPathComponent("Applications/Stan Mic Bridge.app")
+    let stagingRoot = temporary.appendingPathComponent("StanMicBridge-update-\(UUID().uuidString)")
+    try files.createDirectory(at: stagingRoot, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+    defer { try? files.removeItem(at: stagingRoot) }
+    let staged = stagingRoot.appendingPathComponent("expanded/Stan Mic Bridge.app")
+    try files.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try files.createDirectory(at: staged.deletingLastPathComponent(), withIntermediateDirectories: true)
+    if let app = builtApp {
+        try verify(app)
+        try files.copyItem(at: app, to: destination)
+        try files.copyItem(at: app, to: staged)
+        let infoPath = destination.appendingPathComponent("Contents/Info.plist")
+        let data = try Data(contentsOf: infoPath)
+        guard var info = try PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else {
+            throw UpdateError.message("The test app has no Info.plist dictionary.")
+        }
+        let newBuild = try bundleBuild(app)
+        try require(newBuild > 1, "The install-path fixture needs a build greater than 1.")
+        info["CFBundleVersion"] = String(newBuild - 1)
+        try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0).write(to: infoPath)
+        try run("/usr/bin/codesign", ["--force", "--sign", "-", destination.path])
+    } else {
+        try files.createDirectory(at: destination, withIntermediateDirectories: false)
+        try files.createDirectory(at: staged, withIntermediateDirectories: false)
+    }
+    let checked = try installationPaths(destination: destination, staged: staged, home: home, temporary: temporary)
+    let checkedAgain = try installationPaths(destination: checked.destination, staged: checked.staged,
+                                             home: home, temporary: temporary)
+    try require(checked.destination.path == checkedAgain.destination.path && checked.staged.path == checkedAgain.staged.path,
+                "Raw and canonical anchor spellings disagree.")
+    print("Production install preflight accepted raw and canonical trusted-anchor spellings.")
+    // Every untrusted descendant must remain a real directory, including a link
+    // whose target stays inside the anchor (not only links that escape it).
+    let attacks = [destination.deletingLastPathComponent(), destination, stagingRoot,
+                   staged.deletingLastPathComponent(), staged]
+    for original in attacks {
+        let saved = original.deletingLastPathComponent().appendingPathComponent("saved-\(UUID().uuidString)")
+        try files.moveItem(at: original, to: saved)
+        do {
+            try files.createSymbolicLink(at: original, withDestinationURL: saved)
+            var rejected = false
+            do { _ = try installationPaths(destination: destination, staged: staged, home: home, temporary: temporary) }
+            catch { rejected = String(describing: error).contains("symbolic link") }
+            try files.removeItem(at: original)
+            try files.moveItem(at: saved, to: original)
+            try require(rejected, "A descendant symbolic link was not rejected: \(original.lastPathComponent)")
+            print("Rejected descendant link: \(original.lastPathComponent)")
+        } catch {
+            if let attributes = try? files.attributesOfItem(atPath: original.path),
+               attributes[.type] as? FileAttributeType == .typeSymbolicLink {
+                try? files.removeItem(at: original)
+            }
+            if !files.fileExists(atPath: original.path) { try? files.moveItem(at: saved, to: original) }
+            throw error
+        }
+    }
+    if builtApp != nil {
+        let paths = try installationPaths(destination: destination, staged: staged, home: home, temporary: temporary)
+        try verify(paths.destination)
+        try verify(paths.staged)
+        let newBuild = try bundleBuild(paths.staged)
+        try require(newBuild > bundleBuild(paths.destination), "The test replacement is not newer.")
+        let incoming = paths.destination.deletingLastPathComponent().appendingPathComponent(".incoming-test.app")
+        let backup = paths.destination.deletingLastPathComponent().appendingPathComponent("backup-test.app")
+        try files.copyItem(at: paths.staged, to: incoming)
+        try verify(incoming)
+        try replace(destination: paths.destination, incoming: incoming, backup: backup,
+            move: { try files.moveItem(at: $0, to: $1) }, launch: { app in
+                try verify(app)
+                try require(try bundleBuild(app) == newBuild, "Replacement build did not match.")
+                try testStartup(app.path)
+            }, exists: { files.fileExists(atPath: $0.path) })
+        try verify(backup)
+        print("Signed app install preflight, copy, backup, replacement and real startup passed.")
     }
 }
 private func bundleBuild(_ app: URL) throws -> Int {
@@ -137,8 +283,14 @@ private func waitForReadiness(receipt: URL, build: String, timeout: TimeInterval
 private func matchingLaunch(_ app: NSRunningApplication, destination: URL, since: Date) -> Bool {
     guard let bundle = app.bundleURL, let date = app.launchDate else { return false }
     return app.bundleIdentifier == "com.stan.micbridge"
-        && bundle.standardizedFileURL.path == destination.path
+        && sameObservedBundle(bundle, destination)
         && date >= since
+}
+// These URLs are used only to compare an OS-reported running process with an
+// already validated destination. File mutations use installationPaths instead.
+private func sameObservedBundle(_ observed: URL, _ destination: URL) -> Bool {
+    guard let left = try? canonicalAnchor(observed), let right = try? canonicalAnchor(destination) else { return false }
+    return left.path == right.path
 }
 private func stopFailedLaunch(destination: URL, since: Date) throws {
     let candidates = NSRunningApplication.runningApplications(withBundleIdentifier: "com.stan.micbridge")
@@ -165,7 +317,10 @@ private func stopFailedLaunch(destination: URL, since: Date) throws {
     }
     // Never move a bundle still used by any app, including a simultaneous manual launch.
     let stillRunning = NSRunningApplication.runningApplications(withBundleIdentifier: "com.stan.micbridge")
-        .contains { $0.bundleURL?.standardizedFileURL.path == destination.path && !$0.isTerminated && kill($0.processIdentifier, 0) == 0 }
+        .contains {
+            guard let bundle = $0.bundleURL else { return false }
+            return sameObservedBundle(bundle, destination) && !$0.isTerminated && kill($0.processIdentifier, 0) == 0
+        }
     try require(!stillRunning, "An app is still using the replacement bundle. The original backup was retained.")
 }
 private func waitForParent(_ pid: pid_t, timeout: TimeInterval = 30) throws {
@@ -187,30 +342,15 @@ private func install(_ arguments: [String]) throws {
     // A reused PID can only cause a bounded timeout, never termination.
     try require(getppid() == parent || getppid() == 1, "The updater was not launched by the expected app.")
     try require(arguments[1].hasPrefix("/") && arguments[2].hasPrefix("/"), "Absolute app paths are required.")
-    let destination = URL(fileURLWithPath: arguments[2]).standardizedFileURL
-    let expected = files.homeDirectoryForCurrentUser.appendingPathComponent("Applications/Stan Mic Bridge.app").standardizedFileURL
-    try require(destination.path == expected.path, "This updater only supports ~/Applications/Stan Mic Bridge.app.")
-    try noSymlinks(destination)
-    let staged = URL(fileURLWithPath: arguments[1]).standardizedFileURL
-    let resolvedStage = staged.resolvingSymlinksInPath()
-    let temporary = files.temporaryDirectory.resolvingSymlinksInPath().standardizedFileURL
-    try require(resolvedStage.path.hasPrefix(temporary.path + "/") && resolvedStage.pathExtension == "app",
-                "The new app must be staged in the current user's temporary directory.")
-    // Resolve macOS's /var -> /private/var alias, then reject links below it.
-    try noSymlinks(resolvedStage)
+    let paths = try installationPaths(destination: URL(fileURLWithPath: arguments[2]),
+        staged: URL(fileURLWithPath: arguments[1]), home: files.homeDirectoryForCurrentUser,
+        temporary: files.temporaryDirectory)
+    let destination = paths.destination
+    let resolvedStage = paths.staged
+    let temporary = paths.temporary
     let expanded = resolvedStage.deletingLastPathComponent()
-    let stagingRoot = expanded.deletingLastPathComponent()
+    let stagingRoot = paths.stagingRoot
     let prefix = "StanMicBridge-update-"
-    try require(expanded.lastPathComponent == "expanded"
-        && stagingRoot.deletingLastPathComponent().path == temporary.path
-        && stagingRoot.lastPathComponent.hasPrefix(prefix)
-        && UUID(uuidString: String(stagingRoot.lastPathComponent.dropFirst(prefix.count))) != nil,
-        "The updater staging directory has an unexpected layout.")
-    try noSymlinks(stagingRoot)
-    let stagingAttributes = try files.attributesOfItem(atPath: stagingRoot.path)
-    let owner = (stagingAttributes[.ownerAccountID] as? NSNumber)?.uint32Value
-    let mode = (stagingAttributes[.posixPermissions] as? NSNumber)?.intValue ?? 0o777
-    try require(owner == geteuid() && mode & 0o077 == 0, "The update staging directory must be private to the current user.")
     let receipt = stagingRoot.appendingPathComponent("update-ready.json")
     try require(!files.fileExists(atPath: receipt.path), "A startup receipt already exists. Please retry the update.")
     try verify(resolvedStage)
@@ -221,7 +361,8 @@ private func install(_ arguments: [String]) throws {
     // permission to capture from a persisted preference alone.
     let resumeRequested = consumeResumeIntent(root: stagingRoot, parent: parent, build: String(newBuild))
     try waitForParent(parent)
-    try noSymlinks(destination)
+    _ = try installationPaths(destination: destination, staged: resolvedStage,
+        home: files.homeDirectoryForCurrentUser, temporary: files.temporaryDirectory)
     try require(try bundleBuild(destination) == oldBuild, "The installed app changed during the update. Please retry.")
     let applications = destination.deletingLastPathComponent()
     try require(files.isWritableFile(atPath: applications.path) && files.isWritableFile(atPath: destination.path),
@@ -327,10 +468,10 @@ private func selfTest() throws {
 // stopped. This mode never replaces an installation or starts microphone input.
 private func testStartup(_ path: String, resume: Bool = false) throws {
     try require(path.hasPrefix("/"), "The startup test requires an absolute app path.")
-    let app = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
+    let app = try canonicalAnchor(URL(fileURLWithPath: path))
     try verify(app)
     let build = try bundleBuild(app)
-    let root = files.temporaryDirectory.resolvingSymlinksInPath()
+    let root = try canonicalAnchor(files.temporaryDirectory)
         .appendingPathComponent("StanMicBridge-update-\(UUID().uuidString)")
     try files.createDirectory(at: root, withIntermediateDirectories: false,
                               attributes: [.posixPermissions: 0o700])
@@ -369,11 +510,14 @@ do {
     let arguments = Array(CommandLine.arguments.dropFirst())
     if arguments == ["--self-test"] { try selfTest() }
     else if arguments == ["--test-paths"] { try testPaths() }
+    else if arguments.count == 2 && arguments[0] == "--test-install-paths" {
+        try testPaths(builtApp: URL(fileURLWithPath: arguments[1]))
+    }
     else if arguments.count == 2 && arguments[0] == "--test-startup" { try testStartup(arguments[1]) }
     else if arguments.count == 2 && arguments[0] == "--test-startup-resume" { try testStartup(arguments[1], resume: true) }
     else { try install(arguments) }
 } catch {
-    if CommandLine.arguments.contains("--self-test") || CommandLine.arguments.contains("--test-paths") || CommandLine.arguments.contains("--test-startup") || CommandLine.arguments.contains("--test-startup-resume") {
+    if CommandLine.arguments.contains("--self-test") || CommandLine.arguments.contains("--test-paths") || CommandLine.arguments.contains("--test-install-paths") || CommandLine.arguments.contains("--test-startup") || CommandLine.arguments.contains("--test-startup-resume") {
         fputs("Updater test failed: \(error)\n", stderr)
     } else {
         NSApplication.shared.setActivationPolicy(.accessory)
