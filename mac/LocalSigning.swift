@@ -193,7 +193,7 @@ enum LocalSigning {
     static func sign(_ path: URL, identifier: String, config: Configuration) throws {
         try run("/usr/bin/codesign", ["--force", "--sign", config.certificateSHA1,
             "--keychain", config.keychainPath, "--identifier", identifier, "--timestamp=none",
-            "--requirements", "designated => " + requirement(identifier: identifier, fingerprint: config.certificateSHA1), path.path], timeout: 120)
+            "--requirements", "=designated => " + requirement(identifier: identifier, fingerprint: config.certificateSHA1), path.path], timeout: 120)
         try verifyPinned(path, config: config, identifier: identifier)
     }
     static func signApp(_ app: URL, config: Configuration) throws {

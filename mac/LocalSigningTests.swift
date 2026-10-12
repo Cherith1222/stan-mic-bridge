@@ -13,6 +13,12 @@ enum LocalSigningTests {
         defer { try? files.removeItem(at: root) }
         let keychainURL = root.appendingPathComponent("test.keychain-db")
         let password = UUID().uuidString + UUID().uuidString
+        var originalSearchList: CFArray?
+        try LocalSigning.check(SecKeychainCopySearchList(&originalSearchList), "Save the test keychain search list")
+        guard let savedSearchList = originalSearchList, let existing = savedSearchList as? [SecKeychain] else {
+            throw LocalSigning.Failure(message: "The keychain search list could not be saved.")
+        }
+        defer { SecKeychainSetSearchList(savedSearchList) }
         var created: SecKeychain?
         let result = password.withCString { pointer in
             SecKeychainCreate(keychainURL.path, UInt32(password.utf8.count), pointer, false, nil, &created)
@@ -21,6 +27,12 @@ enum LocalSigningTests {
         guard let keychain = created else { throw LocalSigning.Failure(message: "The test keychain was not created.") }
         var keychainDeleted = false
         defer { if !keychainDeleted { SecKeychainDelete(keychain) } }
+        // codesign's certificate/private-key lookup also consults the user's
+        // search list, even with --keychain. Unlike the production default
+        // keychain, a newly created isolated fixture is not necessarily listed.
+        let alreadyListed = existing.contains { (try? LocalSigning.keychainPath($0)) == (try? LocalSigning.keychainPath(keychain)) }
+        print("Local signing diagnostic: isolated keychain initially in search list = \(alreadyListed)")
+        try LocalSigning.check(SecKeychainSetSearchList(([keychain] + existing) as CFArray), "Register only the isolated test keychain")
         // Test processes must fail instead of opening a permission dialog on CI.
         SecKeychainSetUserInteractionAllowed(false)
         let context = LocalSigning.Context(anchor: root, directory: root.appendingPathComponent("state"), creationKeychain: keychain)
@@ -32,6 +44,7 @@ enum LocalSigningTests {
             "-l", config.label, "-s", "-k", password, config.keychainPath])
         try assertNonExtractable(config: config)
         print("Local signing: isolated identity imported; private key is non-extractable.")
+        try publicIdentityDiagnostic(config: config)
         let oldApp = root.appendingPathComponent("old/Stan Mic Bridge.app")
         let newApp = root.appendingPathComponent("new/Stan Mic Bridge.app")
         try files.createDirectory(at: oldApp.deletingLastPathComponent(), withIntermediateDirectories: false)
@@ -78,6 +91,21 @@ enum LocalSigningTests {
                                  "A failed update changed the installed fixture.")
         print("Local signing: bad pin, missing configuration and missing identity fail closed; original fixture retained.")
         print("Local signing integration tests passed. No TCC permission grant or microphone capture was attempted.")
+    }
+    static func publicIdentityDiagnostic(config: LocalSigning.Configuration) throws {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        task.arguments = ["find-identity", "-p", "codesigning", config.keychainPath]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+        try task.run()
+        let output = pipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        // Certificate hashes/labels/status only. Never enumerate or print keys,
+        // passwords, receiver credentials, or other keychains' contents.
+        print("Local signing identity diagnostic:\n" + String(decoding: output.prefix(4096), as: UTF8.self))
+        try LocalSigning.require(task.terminationStatus == 0, "The public identity diagnostic failed.")
     }
     static func expectFailure(_ label: String, action: () throws -> Void) throws {
         var rejected = false
