@@ -370,6 +370,7 @@ private func install(_ arguments: [String]) throws {
     let incoming = applications.appendingPathComponent(".StanMicBridge-incoming-\(UUID().uuidString).app")
     let backup = applications.appendingPathComponent("Stan Mic Bridge-backup-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString).app")
     try files.copyItem(at: resolvedStage, to: incoming)
+    try LocalSigning.prepareDownloadedApp(at: incoming, installedApp: destination)
     try verify(incoming)
     try require(try bundleBuild(incoming) == newBuild, "The staged build changed during installation.")
     var launchTime: Date?
@@ -506,9 +507,36 @@ private func testStartup(_ path: String, resume: Bool = false) throws {
     try stopFailedLaunch(destination: app, since: started)
     print("Real LaunchServices startup receipt and safe termination passed; microphone remained stopped.")
 }
+private func signingSetupStage(_ path: String) throws -> URL {
+    try require(path.hasPrefix("/"), "The installer staging app must use an absolute path.")
+    let stage = try noSymlinksUnderAnchor(URL(fileURLWithPath: path), anchor: files.temporaryDirectory)
+    try require(stage.lastPathComponent == "Stan Mic Bridge.app", "Unexpected installer staging app name.")
+    try verify(stage)
+    return stage
+}
+@main
+struct UpdaterMain {
+static func main() {
 do {
     let arguments = Array(CommandLine.arguments.dropFirst())
     if arguments == ["--self-test"] { try selfTest() }
+    else if arguments.count == 2 && arguments[0] == "--setup-local-signing" {
+        try LocalSigning.setup(app: signingSetupStage(arguments[1]))
+        print("The staging app now uses the pinned local signing identity.")
+    }
+    else if arguments.count == 3 && arguments[0] == "--prepare-local-signing" {
+        let stage = try signingSetupStage(arguments[1])
+        let home = files.homeDirectoryForCurrentUser
+        let supplied = URL(fileURLWithPath: arguments[2])
+        let expected = home.appendingPathComponent("Applications/Stan Mic Bridge.app")
+        let canonicalExpected = try canonicalAnchor(home).appendingPathComponent("Applications/Stan Mic Bridge.app")
+        try require(supplied.path == expected.path || supplied.path == canonicalExpected.path,
+                    "The installer destination must be ~/Applications/Stan Mic Bridge.app.")
+        let installed = files.fileExists(atPath: supplied.path)
+            ? try noSymlinksUnderAnchor(supplied, anchor: home) : nil
+        try LocalSigning.prepareInstallerApp(at: stage, installedApp: installed)
+        print("Installer signing policy verified.")
+    }
     else if arguments == ["--test-paths"] { try testPaths() }
     else if arguments.count == 2 && arguments[0] == "--test-install-paths" {
         try testPaths(builtApp: URL(fileURLWithPath: arguments[1]))
@@ -517,7 +545,7 @@ do {
     else if arguments.count == 2 && arguments[0] == "--test-startup-resume" { try testStartup(arguments[1], resume: true) }
     else { try install(arguments) }
 } catch {
-    if CommandLine.arguments.contains("--self-test") || CommandLine.arguments.contains("--test-paths") || CommandLine.arguments.contains("--test-install-paths") || CommandLine.arguments.contains("--test-startup") || CommandLine.arguments.contains("--test-startup-resume") {
+    if CommandLine.arguments.dropFirst().first?.hasPrefix("--") == true {
         fputs("Updater test failed: \(error)\n", stderr)
     } else {
         NSApplication.shared.setActivationPolicy(.accessory)
@@ -529,4 +557,6 @@ do {
         alert.runModal()
     }
     exit(1)
+}
+}
 }

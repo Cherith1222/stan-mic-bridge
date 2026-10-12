@@ -1,6 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")"
+if [[ $# -gt 1 || ( $# -eq 1 && "$1" != --local-signing ) ]]; then
+  echo 'Usage: bash install.command [--local-signing]' >&2
+  exit 1
+fi
 if [[ "$(uname -s)" != Darwin ]]; then
   echo 'This installer must run on your Mac.' >&2
   exit 1
@@ -25,6 +29,13 @@ app="$stage/Stan Mic Bridge.app"
 mkdir -p "$HOME/Applications"
 bash build-app.command "$stage"
 destination="$HOME/Applications/Stan Mic Bridge.app"
+if [[ "${1:-}" == --local-signing ]]; then
+  echo "Setting up or reusing this Mac's fixed signing identity. macOS may ask for Keychain approval."
+  "$app/Contents/Helpers/StanMicUpdater" --setup-local-signing "$app"
+else
+  # Preserve an existing local identity even when the flag is omitted on a later install.
+  "$app/Contents/Helpers/StanMicUpdater" --prepare-local-signing "$app" "$destination"
+fi
 if [[ -e "$destination" ]]; then
   backup="$HOME/Applications/Stan Mic Bridge.backup.$(date +%Y%m%d-%H%M%S).app"
   [[ ! -e "$backup" ]] || { echo 'Backup already exists; try again later.' >&2; exit 1; }

@@ -22,9 +22,10 @@ for arch in "${archs[@]}"; do
   echo "Building $arch app and update helper…"
   xcrun swiftc -swift-version 5 -O -target "${arch}-apple-macosx12.0" \
     -framework AppKit -framework AVFoundation -framework Security -framework CryptoKit \
-    StanMicBridge.swift -o "$stage/StanMicBridge-$arch"
+    StanMicBridge.swift LocalSigning.swift -o "$stage/StanMicBridge-$arch"
   xcrun swiftc -swift-version 5 -O -target "${arch}-apple-macosx12.0" \
-    -framework AppKit UpdateHelper.swift -o "$stage/StanMicUpdater-$arch"
+    -framework AppKit -framework Security -framework CryptoKit \
+    UpdateHelper.swift LocalSigning.swift -o "$stage/StanMicUpdater-$arch"
   main_binaries+=("$stage/StanMicBridge-$arch")
   helper_binaries+=("$stage/StanMicUpdater-$arch")
 done

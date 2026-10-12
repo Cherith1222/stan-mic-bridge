@@ -82,7 +82,7 @@ bash mac/install.command
 
 The installer builds with Apple Swift, locally signs the app, and installs `~/Applications/Stan Mic Bridge.app`. It preserves an older installation as a dated backup and asks you to quit a running copy before upgrading. No Homebrew or third-party Mac runtime is needed. A rebuilt app may prompt again for microphone or Keychain access.
 
-The app checks the existing microphone authorization before starting. It requests access only when the system reports that permission has not been decided; an already-authorized Start goes directly to connection. Login startup, microphone permission, and Keychain access are separate settings. Stopping and starting the same installation should reuse its permission. Because this installer uses ad-hoc signing, a rebuilt version has a different code identity and macOS may ask again after an upgrade. This does not mean every Start requires approval. [Apple's code-signing requirements](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements).
+The app checks the existing microphone authorization before starting. It requests access only when the system reports that permission has not been decided; an already-authorized Start goes directly to connection. Login startup, microphone permission, and Keychain access are separate settings. Stopping and starting the same installation should reuse its permission. Ad-hoc builds have a version-specific code identity and may prompt again after upgrades; the optional fixed local signing setup below keeps a persistent identity instead. [Apple's code-signing requirements](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements).
 
 The icon is generated reproducibly from `mac/GenerateIcon.swift` using AppKit and packaged as `AppIcon.icns` before signing. No external image download is required.
 
@@ -108,7 +108,7 @@ For a newer version, choose **下載並安裝更新** (Download and install upda
 
 Starting in 1.2.2, **更新後自動恢復傳送** (Resume transmission after update) is an optional menu setting, off by default. When enabled, an update may resume only if transmission is still active with a ready receiver at installation handoff. Stopping transmission or turning the option off during download prevents resumption; a session still connecting, retrying, or awaiting microphone permission does not qualify. The request applies only to that update launch, requires saved connection credentials and existing microphone authorization, and is consumed once. Normal relaunch, login, and crash recovery never use it. If macOS requires microphone authorization again, the app remains stopped and asks you to use Start. Updating from 1.2.1 into 1.2.2 still starts stopped; enable the option in 1.2.2 for subsequent updates.
 
-An independent helper waits for the old app to exit, preserves its bundle as a backup, and verifies that the new app reaches its UI startup checkpoint. Replacement and startup failures trigger restoration where safe; if an unresponsive new process cannot be stopped, the helper leaves the backup intact and explains how to restore it instead of modifying a running app. Startup readiness does not prove microphone or network functionality. The helper does not touch Keychain, so connection data is retained. macOS may ask again for microphone or Keychain authorization after an update.
+An independent helper waits for the old app to exit, preserves its bundle as a backup, and verifies that the new app reaches its UI startup checkpoint. Replacement and startup failures trigger restoration where safe; if an unresponsive new process cannot be stopped, the helper leaves the backup intact and explains how to restore it instead of modifying a running app. Startup readiness does not prove microphone or network functionality. Connection credentials remain in Keychain. With fixed local signing enabled, the updater also uses the local signing identity in Keychain; it does not rewrite the connection credentials.
 
 Versions before 1.2.0 need one manual upgrade (Finder replacement or source installer) before in-app installation is available. There are no scheduled checks or silent installations. Automatic transmission after an update requires the explicit option and the conditions above. Missing or invalid release assets are refused rather than installed.
 
@@ -116,11 +116,25 @@ Versions before 1.2.0 need one manual upgrade (Finder replacement or source inst
 
 ### Signing identity and repeated permission prompts
 
-The current release packages use ad-hoc signing. Their designated requirements are tied to a particular build, so updates can cause macOS to ask again for microphone or Keychain access. An auto-resume preference cannot grant those permissions.
+Public release packages use ad-hoc signing. Their designated requirements are tied to a particular build, so updates can cause macOS to ask again for microphone or Keychain access. An auto-resume preference cannot grant those permissions.
 
-A paid Developer ID is not the only way to establish a stable code identity for personal use. Apple documents that a persistent self-signed code-signing identity can provide stable designated requirements, including for Keychain access. Every update must use that same identity; signing just one installation and then replacing it with an ad-hoc release loses that continuity. This is distinct from Developer ID notarization and does not remove Gatekeeper checks. Microphone-permission retention must still be verified across updates on the target macOS installation. The current updater does not re-sign downloads with a local certificate.
+A paid Developer ID is not required for the optional fixed local signing mode introduced in 1.3.0. After quitting the running app, use the source installer once:
+
+```bash
+bash mac/install.command --local-signing
+```
+
+This creates or reuses a persistent self-signed code-signing identity on this Mac and signs the new app before installation. The private key stays in this Mac's Keychain; only a public certificate fingerprint is saved in the app's local configuration. The first transition from ad-hoc signing can require microphone and Keychain approval again. Do not delete the signing identity or its configuration between updates.
+
+When enabled, future in-app updates still validate the original release download, then locally sign the app and helper with the same pinned identity and check designated-requirement continuity before installation. Missing keys or identity mismatches stop the update instead of silently reverting to ad-hoc signing. The menu displays local signing status. This is personal-use signing, not Developer ID notarization; it does not disable Gatekeeper or change microphone privacy settings. Permission retention must still be confirmed across updates on the target Mac, especially after migration or OS policy changes.
+
+Use the in-app updater or the source installer to preserve this identity. Replacing the app directly with the public ad-hoc ZIP loses the local signature and can cause another permission prompt.
 
 References: [Apple TN2206: Code signing in depth](https://developer.apple.com/library/archive/technotes/tn2206/) and [Apple TN3127: Code signing requirements](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements).
+
+### Audio diagnostics
+
+**音訊狀態…** (Audio status) displays local session counters to compare captured, converted, sent, and discarded audio frames. It does not record audio, persist speech, or include connection credentials. These counters help identify missing audio; they are not a speech-recognition accuracy score. The transport uses uncompressed 48 kHz mono float32 PCM. Different microphones, source processing, network jitter, and queue starvation can affect the result heard by a Windows dictation app.
 
 ## Browser alternative
 

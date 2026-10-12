@@ -458,10 +458,35 @@ private func testUpdatePolicy() {
     for bad in ["../Stan Mic Bridge.app/x", "/Stan Mic Bridge.app/x", "Stan Mic Bridge.app/../x", "Stan Mic Bridge.app/a\\b", "Other.app/x"] {
         precondition(!UpdateStaging.safeEntry(bad))
     }
-    print("Update and microphone authorization policy checks passed")
+    // A five-chunk burst exceeds the existing 100 ms mailbox bound: account
+    // for the dropped oldest chunk separately from subsequent expiry.
+    let box = AudioMailbox(sourceRate: 48000, startedAt: 0)
+    box.recordCaptured(5120)
+    box.recordConverted(5120)
+    for _ in 0..<5 { box.put(Data(count: 1024 * MemoryLayout<Float>.size), now: 1) }
+    precondition(box.snapshot(now: 1).overflowFrames == 1024)
+    precondition(box.take(now: 1.2) == nil)
+    let audio = box.snapshot(now: 1.2)
+    precondition(audio.expiredFrames == 4096 && audio.sentFrames == 0)
+    precondition(audio.capturedFrames == 5120 && audio.convertedFrames == 5120 && audio.maximumTapFrames == 5120)
+    box.put(Data(count: 480 * MemoryLayout<Float>.size), now: 2)
+    precondition(box.take(now: 2)?.bytes.count == 1920)
+    box.recordSent(480)
+    precondition(box.snapshot(now: 2).sentFrames == 480)
+    print("Update, microphone authorization, and audio accounting checks passed")
 }
 
 private final class AudioMailbox {
+    struct Snapshot {
+        let sourceRate: Double
+        let elapsed: Double
+        let maximumTapFrames: Int
+        let capturedFrames: Int64
+        let convertedFrames: Int64
+        let sentFrames: Int64
+        let overflowFrames: Int64
+        let expiredFrames: Int64
+    }
     struct Packet {
         let bytes: Data
         let captured: TimeInterval
@@ -470,27 +495,55 @@ private final class AudioMailbox {
     private var packets: [Packet] = []
     private var byteCount = 0
     private var fault = false
+    private let sourceRate: Double
+    private let startedAt: Double
+    private var maximumTapFrames = 0
+    private var capturedFrames: Int64 = 0
+    private var convertedFrames: Int64 = 0
+    private var sentFrames: Int64 = 0
+    private var overflowFrames: Int64 = 0
+    private var expiredFrames: Int64 = 0
 
-    func put(_ data: Data) {
+    init(sourceRate: Double, startedAt: Double = ProcessInfo.processInfo.systemUptime) {
+        self.sourceRate = sourceRate
+        self.startedAt = startedAt
+    }
+    func recordCaptured(_ frames: Int) {
+        lock.lock(); defer { lock.unlock() }
+        capturedFrames += Int64(frames)
+        maximumTapFrames = max(maximumTapFrames, frames)
+    }
+    func recordConverted(_ frames: Int) { lock.lock(); convertedFrames += Int64(frames); lock.unlock() }
+    func recordSent(_ frames: Int) { lock.lock(); sentFrames += Int64(frames); lock.unlock() }
+    func snapshot(now: Double = ProcessInfo.processInfo.systemUptime) -> Snapshot {
+        lock.lock(); defer { lock.unlock() }
+        return Snapshot(sourceRate: sourceRate, elapsed: max(0, now - startedAt), maximumTapFrames: maximumTapFrames,
+                        capturedFrames: capturedFrames, convertedFrames: convertedFrames, sentFrames: sentFrames,
+                        overflowFrames: overflowFrames, expiredFrames: expiredFrames)
+    }
+
+    func put(_ data: Data, now: Double = ProcessInfo.processInfo.systemUptime) {
         lock.lock()
         defer { lock.unlock() }
         // 100 ms of 48 kHz float32 audio. Drop oldest audio on congestion.
         guard !data.isEmpty, data.count <= 19200 else { fault = true; return }
         while !packets.isEmpty && (byteCount + data.count > 19200 || packets.count >= 8) {
-            byteCount -= packets.removeFirst().bytes.count
+            let dropped = packets.removeFirst().bytes.count
+            byteCount -= dropped
+            overflowFrames += Int64(dropped / MemoryLayout<Float>.size)
         }
-        packets.append(Packet(bytes: data, captured: ProcessInfo.processInfo.systemUptime))
+        packets.append(Packet(bytes: data, captured: now))
         byteCount += data.count
     }
 
-    func take() -> Packet? {
+    func take(now: Double = ProcessInfo.processInfo.systemUptime) -> Packet? {
         lock.lock()
         defer { lock.unlock() }
-        let now = ProcessInfo.processInfo.systemUptime
         while !packets.isEmpty {
             let packet = packets.removeFirst()
             byteCount -= packet.bytes.count
             if now - packet.captured < 0.15 { return packet }
+            expiredFrames += Int64(packet.bytes.count / MemoryLayout<Float>.size)
         }
         return nil
     }
@@ -514,10 +567,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let stateItem = NSMenuItem(title: "已停止", action: nil, keyEquivalent: "")
     private let startItem = NSMenuItem(title: "開始傳送", action: #selector(start), keyEquivalent: "")
     private let stopItem = NSMenuItem(title: "停止傳送", action: #selector(stop), keyEquivalent: "")
+    private let audioStatusItem = NSMenuItem(title: "音訊狀態…", action: #selector(showAudioStatus), keyEquivalent: "")
     private let configureItem = NSMenuItem(title: "設定連線…", action: #selector(configure), keyEquivalent: "")
     private let forgetItem = NSMenuItem(title: "清除已儲存的連線…", action: #selector(forget), keyEquivalent: "")
     private let updateItem = NSMenuItem(title: "檢查更新…", action: #selector(checkUpdates), keyEquivalent: "")
     private let versionItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let signingStatusItem = NSMenuItem(title: "簽署：正在確認…", action: nil, keyEquivalent: "")
     private let updateStatusItem = NSMenuItem(title: "尚未檢查更新", action: nil, keyEquivalent: "")
     private let installUpdateItem = NSMenuItem(title: "下載並安裝更新…", action: #selector(confirmUpdate), keyEquivalent: "")
     private let releaseHistoryItem = NSMenuItem(title: "查看版本紀錄…", action: #selector(openReleaseHistory), keyEquivalent: "")
@@ -537,6 +592,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var session: URLSession?
     private var engine: AVAudioEngine?
     private var mailbox: AudioMailbox?
+    private var lastAudioSnapshot: AudioMailbox.Snapshot?
+    private var audioStatusPanel: NSPanel?
     private var engineObserver: NSObjectProtocol?
     private var workspaceObservers: [NSObjectProtocol] = []
     private var timer: Timer?
@@ -559,11 +616,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             item.target = self
             menu.addItem(item)
         }
+        audioStatusItem.target = self
+        menu.addItem(audioStatusItem)
         menu.addItem(.separator())
         versionItem.title = "目前版本：" + (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "未知")
         versionItem.isEnabled = false
+        signingStatusItem.isEnabled = false
         updateStatusItem.isEnabled = false
         menu.addItem(versionItem)
+        menu.addItem(signingStatusItem)
         menu.addItem(updateStatusItem)
         updateItem.target = self
         menu.addItem(updateItem)
@@ -580,6 +641,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         quit.target = self
         menu.addItem(quit)
         statusItem.menu = menu
+        refreshSigningStatus()
         if let image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "Stan Mic Bridge") {
             image.isTemplate = true
             statusItem.button?.image = image
@@ -749,6 +811,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func closeUpdatePanel() { updatePanel?.close() }
+    @objc private func showAudioStatus() {
+        let snapshot = mailbox?.snapshot() ?? lastAudioSnapshot
+        let text: String
+        if let value = snapshot {
+            text = "\(mailbox == nil ? "最近一次音訊連線（已停止）" : "目前音訊連線")\n"
+                + "經過時間：\(String(format: "%.2f", value.elapsed)) 秒\n"
+                + "來源取樣率：\(Int(value.sourceRate)) Hz\n輸出取樣率：48000 Hz\n"
+                + "最大單次收音：\(value.maximumTapFrames) frames\n"
+                + "來源已擷取：\(value.capturedFrames) frames\n"
+                + "已轉換（48 kHz）：\(value.convertedFrames) frames\n"
+                + "WebSocket 傳送完成：\(value.sentFrames) frames\n"
+                + "佇列滿而略過：\(value.overflowFrames) frames\n"
+                + "佇列過期而略過：\(value.expiredFrames) frames\n\n"
+                + "每次音訊重新連線會重新計數。此為按下按鈕時的快照，請按重新整理取得新值。傳送完成不代表接收端已播放。只保留記憶體中的數字，不錄音、不保存連線碼。"
+        } else { text = "尚無音訊傳送資料。開始傳送後，再按重新整理即可查看。這裡只顯示計數，不會啟動麥克風。" }
+        audioStatusPanel?.close()
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 510, height: 400),
+                            styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        panel.title = "音訊狀態"
+        panel.isReleasedWhenClosed = false
+        let label = NSTextField(wrappingLabelWithString: text)
+        label.frame = NSRect(x: 20, y: 65, width: 470, height: 315)
+        label.isSelectable = true
+        panel.contentView?.addSubview(label)
+        let refresh = NSButton(title: "重新整理", target: self, action: #selector(showAudioStatus))
+        refresh.frame = NSRect(x: 20, y: 20, width: 110, height: 30)
+        refresh.bezelStyle = .rounded
+        panel.contentView?.addSubview(refresh)
+        audioStatusPanel = panel
+        panel.center()
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+    }
+    private func refreshSigningStatus() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let text: String
+            do {
+                text = try LocalSigning.isEnabled(for: Bundle.main.bundleURL)
+                    ? "簽署：已啟用固定本機身分" : "簽署：尚未啟用固定本機身分"
+            } catch {
+                text = "簽署：需要修復（更新會停止）"
+            }
+            DispatchQueue.main.async { self?.signingStatusItem.title = text }
+        }
+    }
     private func setUpdateStatus(_ text: String) {
         updateStatusItem.title = text
         statusItem.button?.toolTip = "Stan Mic Bridge — " + stateItem.title + "\n" + versionItem.title + "\n" + text
@@ -827,9 +934,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 catch { self.updateFailed(); return }
                 self.stagingRoot = root
                 DispatchQueue.global(qos: .utility).async {
-                    let staged = try? UpdateStaging.prepare(data, release: release, root: root)
+                    guard let staged = try? UpdateStaging.prepare(data, release: release, root: root) else {
+                        DispatchQueue.main.async { self.updateFailed() }
+                        return
+                    }
+                    do {
+                        // The public digest and signature were verified above.
+                        // Preserve the configured local identity before stopping audio.
+                        try LocalSigning.prepareDownloadedApp(at: staged, installedApp: Bundle.main.bundleURL)
+                    } catch {
+                        DispatchQueue.main.async {
+                            self.updateFailed(detail: "固定本機簽署未完成。請確認登入鑰匙圈已解鎖，並保留設定時建立的簽署憑證與私密金鑰。若身分已遺失，請重新執行一次固定簽署安裝設定後再更新。原本的 App 與連線設定未變更，麥克風可繼續使用。")
+                        }
+                        return
+                    }
                     DispatchQueue.main.async {
-                        guard let staged = staged else { self.updateFailed(); return }
                         let process = Process()
                         process.executableURL = helper
                         process.arguments = [String(ProcessInfo.processInfo.processIdentifier), staged.path, destination.path]
@@ -852,7 +971,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         client.dataTask(with: url).resume()
     }
 
-    private func updateFailed() {
+    private func updateFailed(detail: String? = nil) {
         if let root = stagingRoot { try? FileManager.default.removeItem(at: root) }
         stagingRoot = nil
         installingUpdate = false
@@ -860,7 +979,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateItem.isEnabled = true
         installUpdateItem.isEnabled = offeredRelease != nil
         setUpdateStatus("更新未完成，可重試或重新檢查")
-        showUpdate("更新未完成", "無法下載、驗證或準備更新。原本的 App 與連線設定沒有變更，麥克風可繼續使用。請稍後重新檢查更新。")
+        showUpdate("更新未完成", detail ?? "無法下載、驗證或準備更新。原本的 App 與連線設定沒有變更，麥克風可繼續使用。請稍後重新檢查更新。")
     }
 
     @objc private func configure() {
@@ -1053,10 +1172,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               let converter = AVAudioConverter(from: source, to: target) else {
             throw NSError(domain: "StanMicBridge", code: 1)
         }
-        let box = AudioMailbox()
+        let box = AudioMailbox(sourceRate: source.sampleRate)
         self.engine = engine
         mailbox = box
         input.installTap(onBus: 0, bufferSize: 1024, format: source) { buffer, _ in
+            box.recordCaptured(Int(buffer.frameLength))
             // Conversion happens before returning the tap's borrowed buffer.
             let needed = Int(ceil(Double(buffer.frameLength) * 48000 / source.sampleRate)) + 64
             guard needed > 0, needed <= 32768,
@@ -1074,6 +1194,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             guard result != .error, conversionError == nil else { box.fail(); return }
             guard output.frameLength > 0, let samples = output.floatChannelData?[0] else { return }
+            box.recordConverted(Int(output.frameLength))
             // All supported Mac CPUs use little endian IEEE-754 float32, matching
             // the receiver's '<f4' protocol. Sanitize unexpected hardware values.
             for i in 0..<Int(output.frameLength) {
@@ -1125,6 +1246,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.inFlight = false
                 if error != nil { self.scheduleRetry(message: "傳送中斷，正在重試"); return }
                 self.lastSent = ProcessInfo.processInfo.systemUptime
+                self.mailbox?.recordSent(packet.bytes.count / MemoryLayout<Float>.size)
                 self.sendNext(epoch: epoch)
             }
         }
@@ -1143,6 +1265,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             engine.inputNode.removeTap(onBus: 0)
         }
         engine = nil
+        if let mailbox = mailbox { lastAudioSnapshot = mailbox.snapshot() }
         mailbox = nil
         ready = false
         inFlight = false
@@ -1179,38 +1302,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-if CommandLine.arguments.contains("--test-updates") {
-    testUpdatePolicy()
-    exit(0)
-}
+@main
+private struct StanMicBridgeMain {
+    static func main() {
+        if CommandLine.arguments.contains("--test-updates") {
+            testUpdatePolicy()
+            exit(0)
+        }
 
-// CI validates the exact release ZIP using the same staging path as the UI.
-if CommandLine.arguments.count == 5, CommandLine.arguments[1] == "--test-update-package" {
-    let root = FileManager.default.temporaryDirectory.appendingPathComponent("StanMicBridge-update-" + UUID().uuidString)
-    do {
-        let archive = URL(fileURLWithPath: CommandLine.arguments[2])
-        let tag = CommandLine.arguments[3]
-        let size = try archive.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-        var release = PublicRelease(tag_name: tag,
-            html_url: "https://github.com/Cherith1222/stan-mic-bridge/releases/tag/" + tag,
-            body: nil, draft: false, prerelease: false)
-        release.assets = [.init(name: "StanMicBridge-macOS.zip",
-            browser_download_url: "https://github.com/Cherith1222/stan-mic-bridge/releases/download/" + tag + "/StanMicBridge-macOS.zip",
-            digest: "sha256:" + CommandLine.arguments[4], size: size)]
-        guard release.installAsset != nil else { throw InstallFailure.invalid }
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
-        _ = try UpdateStaging.prepare(Data(contentsOf: archive), release: release, root: root)
-        try FileManager.default.removeItem(at: root)
-        print("Update package validation passed")
-        exit(0)
-    } catch {
-        try? FileManager.default.removeItem(at: root)
-        print("Update package validation failed")
-        exit(1)
+        // CI validates the exact release ZIP using the same staging path as the UI.
+        if CommandLine.arguments.count == 5, CommandLine.arguments[1] == "--test-update-package" {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("StanMicBridge-update-" + UUID().uuidString)
+            do {
+                let archive = URL(fileURLWithPath: CommandLine.arguments[2])
+                let tag = CommandLine.arguments[3]
+                let size = try archive.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+                var release = PublicRelease(tag_name: tag,
+                    html_url: "https://github.com/Cherith1222/stan-mic-bridge/releases/tag/" + tag,
+                    body: nil, draft: false, prerelease: false)
+                release.assets = [.init(name: "StanMicBridge-macOS.zip",
+                    browser_download_url: "https://github.com/Cherith1222/stan-mic-bridge/releases/download/" + tag + "/StanMicBridge-macOS.zip",
+                    digest: "sha256:" + CommandLine.arguments[4], size: size)]
+                guard release.installAsset != nil else { throw InstallFailure.invalid }
+                try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+                _ = try UpdateStaging.prepare(Data(contentsOf: archive), release: release, root: root)
+                try FileManager.default.removeItem(at: root)
+                print("Update package validation passed")
+                exit(0)
+            } catch {
+                try? FileManager.default.removeItem(at: root)
+                print("Update package validation failed")
+                exit(1)
+            }
+        }
+
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.run()
     }
 }
-
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.run()
