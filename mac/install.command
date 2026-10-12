@@ -26,9 +26,13 @@ fi
 stage="$(mktemp -d "${TMPDIR:-/tmp}/stan-mic-build.XXXXXX")"
 trap 'rm -rf -- "$stage"' EXIT
 app="$stage/Stan Mic Bridge.app"
+destination="$HOME/Applications/Stan Mic Bridge.app"
+if [[ -L "$HOME/Applications" || -L "$destination" ]]; then
+  echo 'Installation directory or app must not be a symbolic link.' >&2
+  exit 1
+fi
 mkdir -p "$HOME/Applications"
 bash build-app.command "$stage"
-destination="$HOME/Applications/Stan Mic Bridge.app"
 # Run a separate helper copy so signing the app never rewrites executing code.
 signer="$stage/StanMicSigningHelper"
 cp "$app/Contents/Helpers/StanMicUpdater" "$signer"
