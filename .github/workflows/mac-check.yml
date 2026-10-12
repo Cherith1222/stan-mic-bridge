@@ -1,0 +1,30 @@
+name: Mac build and update checks
+
+on:
+  push:
+    branches: [main]
+    paths: ['mac/**', '.github/workflows/mac-check.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mac:
+    runs-on: macos-15-intel
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate installer and metadata
+        run: |
+          bash -n mac/install.command
+          plutil -lint mac/Info.plist
+      - name: Compile Intel and Apple Silicon binaries
+        run: |
+          for arch in x86_64 arm64; do
+            xcrun swiftc -swift-version 5 -O -target "${arch}-apple-macosx12.0" \
+              -framework AppKit -framework AVFoundation -framework Security \
+              mac/StanMicBridge.swift -o "$RUNNER_TEMP/StanMicBridge-$arch"
+          done
+      - name: Verify release policy without starting capture
+        run: '"$RUNNER_TEMP/StanMicBridge-x86_64" --test-updates'

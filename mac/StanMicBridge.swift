@@ -76,6 +76,70 @@ private enum Credentials {
     }
 }
 
+// Public release metadata is completely separate from the private audio connection.
+private struct StableVersion: Comparable {
+    let parts: [Int]
+    init?(_ value: String) {
+        let text = value.hasPrefix("v") ? String(value.dropFirst()) : value
+        let fields = text.split(separator: ".", omittingEmptySubsequences: false)
+        guard fields.count == 3 else { return nil }
+        var numbers: [Int] = []
+        for field in fields {
+            guard !field.isEmpty, field.allSatisfy({ $0 >= "0" && $0 <= "9" }),
+                  field.count == 1 || field.first != "0", let number = Int(field) else { return nil }
+            numbers.append(number)
+        }
+        parts = numbers
+    }
+    static func < (lhs: Self, rhs: Self) -> Bool {
+        lhs.parts.lexicographicallyPrecedes(rhs.parts)
+    }
+}
+
+private struct PublicRelease: Decodable {
+    let tag_name: String
+    let html_url: String
+    let body: String?
+    let draft: Bool
+    let prerelease: Bool
+
+    var stableVersion: StableVersion? {
+        guard !draft, !prerelease else { return nil }
+        return StableVersion(tag_name)
+    }
+    var trustedURL: URL? {
+        guard stableVersion != nil, let parts = URLComponents(string: html_url),
+              parts.scheme == "https", parts.host == "github.com", parts.port == nil,
+              parts.user == nil, parts.password == nil, parts.query == nil, parts.fragment == nil,
+              parts.percentEncodedPath == "/Cherith1222/stan-mic-bridge/releases/tag/" + tag_name else { return nil }
+        return parts.url
+    }
+}
+
+private func testUpdatePolicy() {
+    precondition(StableVersion("1.9.0")! < StableVersion("1.10.0")!)
+    precondition(StableVersion("v1.1.0")! == StableVersion("1.1.0")!)
+    precondition(StableVersion("2.0.0")! > StableVersion("1.99.99")!)
+    for bad in ["1.0", "01.0.0", "1.0.0-beta", "1.0.0+dev", "1.-1.0", "1.0.0/"] {
+        precondition(StableVersion(bad) == nil)
+    }
+    let canonical = "https://github.com/Cherith1222/stan-mic-bridge/releases/tag/v1.1.0"
+    func release(_ url: String, draft: Bool = false, prerelease: Bool = false) -> PublicRelease {
+        PublicRelease(tag_name: "v1.1.0", html_url: url, body: nil, draft: draft, prerelease: prerelease)
+    }
+    precondition(release(canonical).trustedURL != nil)
+    precondition(release(canonical, draft: true).trustedURL == nil)
+    precondition(release(canonical, prerelease: true).trustedURL == nil)
+    for bad in [canonical + "?x=1", canonical + "#x", canonical + "/extra",
+                canonical.replacingOccurrences(of: "https:", with: "http:"),
+                canonical.replacingOccurrences(of: "github.com", with: "github.com.evil.test"),
+                canonical.replacingOccurrences(of: "Cherith1222", with: "someone"),
+                canonical.replacingOccurrences(of: "v1.1.0", with: "v2.0.0")] {
+        precondition(release(bad).trustedURL == nil)
+    }
+    print("Update policy checks passed")
+}
+
 private final class AudioMailbox {
     struct Packet {
         let bytes: Data
@@ -131,6 +195,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let stopItem = NSMenuItem(title: "停止傳送", action: #selector(stop), keyEquivalent: "")
     private let configureItem = NSMenuItem(title: "設定連線…", action: #selector(configure), keyEquivalent: "")
     private let forgetItem = NSMenuItem(title: "清除已儲存的連線…", action: #selector(forget), keyEquivalent: "")
+    private let updateItem = NSMenuItem(title: "檢查更新…", action: #selector(checkUpdates), keyEquivalent: "")
+    private var updateSession: URLSession?
+    private var updatePanel: NSPanel?
+    private var releaseURL: URL?
     private var connection: Connection?
     private var enabled = false
     private var sleeping = false
@@ -162,6 +230,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             item.target = self
             menu.addItem(item)
         }
+        menu.addItem(.separator())
+        updateItem.target = self
+        menu.addItem(updateItem)
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "結束 Stan Mic Bridge", action: #selector(quitApp), keyEquivalent: "q")
         quit.target = self
@@ -195,6 +266,115 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stopItem.isEnabled = enabled
         configureItem.isEnabled = !enabled
         forgetItem.isEnabled = !enabled && connection != nil
+    }
+
+    @objc private func checkUpdates() {
+        guard updateSession == nil else { return }
+        updateItem.isEnabled = false
+        updateItem.title = "正在檢查更新…"
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 15
+        configuration.timeoutIntervalForResource = 20
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.urlCredentialStorage = nil
+        configuration.urlCache = nil
+        let client = URLSession(configuration: configuration, delegate: NoRedirectDelegate(), delegateQueue: nil)
+        updateSession = client
+        var request = URLRequest(url: URL(string: "https://api.github.com/repos/Cherith1222/stan-mic-bridge/releases/latest")!)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
+        request.setValue("Stan-Mic-Bridge-Update-Check", forHTTPHeaderField: "User-Agent")
+        client.dataTask(with: request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                guard let self = self else { client.finishTasksAndInvalidate(); return }
+                self.updateSession = nil
+                client.finishTasksAndInvalidate()
+                self.updateItem.isEnabled = true
+                self.updateItem.title = "檢查更新…"
+                if error != nil {
+                    self.showUpdate("無法檢查更新", "連線逾時或網路暫時無法使用，請稍後再試。麥克風傳送不受影響。")
+                    return
+                }
+                guard let response = response as? HTTPURLResponse else {
+                    self.showUpdate("無法檢查更新", "GitHub 回應無法辨識，請稍後再試。")
+                    return
+                }
+                if response.statusCode == 404 {
+                    self.showUpdate("尚無可用版本", "GitHub 目前沒有可取得的正式發布版本。你可以繼續使用目前版本。")
+                    return
+                }
+                if response.statusCode == 403 || response.statusCode == 429 {
+                    self.showUpdate("GitHub 暫時限制請求", "可能已達公開 API 的請求限制，或 GitHub 拒絕此請求。請稍後再手動檢查。")
+                    return
+                }
+                guard response.statusCode == 200, let data = data, data.count <= 1048576,
+                      let release = try? JSONDecoder().decode(PublicRelease.self, from: data) else {
+                    self.showUpdate("無法檢查更新", "GitHub 回應不完整或服務暫時無法使用，請稍後再試。")
+                    return
+                }
+                guard let latest = release.stableVersion, let url = release.trustedURL else {
+                    self.showUpdate("沒有可用的正式更新", "收到的版本或發布網址無法確認；不會開啟或安裝此更新。")
+                    return
+                }
+                let currentText = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "未知"
+                guard let current = StableVersion(currentText) else {
+                    self.showUpdate("無法判斷目前版本", "請到 GitHub 的正式發布頁面確認目前的安裝版本。")
+                    return
+                }
+                guard latest > current else {
+                    self.showUpdate("已是最新版本", "目前版本：\(currentText)\n最新正式版本：\(release.tag_name)")
+                    return
+                }
+                let rawNotes = release.body ?? "此版本未提供更新說明。"
+                let notes = String(rawNotes.prefix(6000)) + (rawNotes.count > 6000 ? "\n…完整說明請查看發布頁面。" : "")
+                self.showUpdate("有新版本可用", "目前版本：\(currentText)\n最新版本：\(release.tag_name)\n\n\(notes)\n\n按下方按鈕只會開啟 GitHub 發布頁面。請自行下載及執行安裝；安裝前先停止傳送並結束程式。", url: url)
+            }
+        }.resume()
+    }
+
+    // A modeless panel leaves the audio run loop running while release notes are read.
+    private func showUpdate(_ title: String, _ detail: String, url: URL? = nil) {
+        updatePanel?.close()
+        releaseURL = url
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 540, height: 390),
+                            styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        panel.title = title
+        panel.isReleasedWhenClosed = false
+        let scroll = NSScrollView(frame: NSRect(x: 20, y: 65, width: 500, height: 305))
+        scroll.hasVerticalScroller = true
+        let text = NSTextView(frame: NSRect(x: 0, y: 0, width: 480, height: 305))
+        text.isEditable = false
+        text.isSelectable = true
+        text.font = NSFont.systemFont(ofSize: 13)
+        text.string = detail
+        text.isVerticallyResizable = true
+        text.isHorizontallyResizable = false
+        text.textContainer?.widthTracksTextView = true
+        scroll.documentView = text
+        panel.contentView?.addSubview(scroll)
+        let close = NSButton(title: "關閉", target: self, action: #selector(closeUpdatePanel))
+        close.frame = NSRect(x: 430, y: 20, width: 90, height: 30)
+        close.bezelStyle = .rounded
+        panel.contentView?.addSubview(close)
+        if url != nil {
+            let open = NSButton(title: "查看更新與安裝", target: self, action: #selector(openRelease))
+            open.frame = NSRect(x: 20, y: 20, width: 180, height: 30)
+            open.bezelStyle = .rounded
+            panel.contentView?.addSubview(open)
+        }
+        updatePanel = panel
+        panel.center()
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func closeUpdatePanel() { updatePanel?.close() }
+    @objc private func openRelease() {
+        guard let url = releaseURL else { return }
+        if !NSWorkspace.shared.open(url) {
+            showUpdate("無法開啟瀏覽器", "請稍後再試，或手動前往 github.com/Cherith1222/stan-mic-bridge/releases。")
+        }
     }
 
     @objc private func configure() {
@@ -295,6 +475,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let epoch = generation
         let configuration = URLSessionConfiguration.ephemeral
         configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
         configuration.urlCache = nil
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         let session = URLSession(configuration: configuration, delegate: NoRedirectDelegate(), delegateQueue: nil)
@@ -489,8 +670,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         stop()
+        updateSession?.invalidateAndCancel()
         for observer in workspaceObservers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
     }
+}
+
+if CommandLine.arguments.contains("--test-updates") {
+    testUpdatePolicy()
+    exit(0)
 }
 
 let app = NSApplication.shared

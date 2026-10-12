@@ -15,6 +15,7 @@ Windows receiver → VB-CABLE → Windows default microphone → your app
 - Native Mac sender with Start, Stop, connection status, and automatic reconnect.
 - Close Chrome and Terminal while the menu bar app keeps running.
 - Save the connection once in macOS Keychain; no repeated token entry.
+- Manually check GitHub releases from the menu, then choose whether to open the update instructions.
 - Convert microphone audio to 48 kHz mono Float32 with bounded buffering.
 - Switch Windows default microphone roles on first audio, then restore them when the session ends.
 - Browser sender included as an alternative; its tab must remain open.
@@ -92,6 +93,14 @@ In **System Settings → General → Login Items** (or **Login Items & Extension
 
 This opens the menu bar app after login. **Each new launch starts stopped; click Start to transmit.** It does not enable unattended recording. An enabled session can reconnect after sleep/wake, but the Mac cannot send while asleep or powered off.
 
+### Check for updates
+
+Choose **檢查更新…** (Check for updates) in the Mic menu. The app contacts this project's public GitHub Releases API only when clicked, compares the latest stable version, and displays its release notes. Checking does not stop recording and does not send your microphone connection credentials to GitHub.
+
+For a newer version, choose **查看更新與安裝** to open its release page. Download `StanMicBridge-source.zip`, quit the existing app, extract the archive, and run `bash StanMicBridge/install.command` from the extracted parent folder. Installation is manual; the app never downloads or executes an updater in the background. The installer preserves an older app as a backup and keeps the same bundle identifier and Keychain service. Your saved connection stays in Keychain, though macOS can ask you to authorize access again after rebuilding.
+
+Version 1.0.0 has no update menu, so upgrade it once with the release installer. There are no scheduled checks, silent installations, or automatic recording after updates.
+
 ## Browser alternative
 
 Open the same private pairing link in a microphone-capable browser, press Start, and keep that tab open. The browser stores its token only in page memory, so a reload may require the link again. The native app uses Keychain and does not need Chrome.
@@ -103,7 +112,7 @@ Open the same private pairing link in a microphone-capable browser, press Start,
 - A different microphone manually selected during a session is preserved when restoring.
 - All three Windows default capture roles change while forwarding. Some applications cache their device and need recording restarted.
 - The native sender currently has no acoustic echo cancellation or noise suppression. Headphones help prevent the remote speaker output from re-entering the microphone.
-- Mac UI is currently Traditional Chinese. There is no notarized binary or automatic updater.
+- Mac UI is currently Traditional Chinese. There is no notarized binary; updates use a source installer and Apple Command Line Tools.
 - Devices producing very large audio batches can lose older samples under the low-latency queue limit.
 
 ## Verification
