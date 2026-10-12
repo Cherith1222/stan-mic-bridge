@@ -130,6 +130,8 @@ When enabled, future in-app updates still validate the original release download
 
 Use the in-app updater or the source installer to preserve this identity. Replacing the app directly with the public ad-hoc ZIP loses the local signature and can cause another permission prompt.
 
+If Keychain is locked or signing authorization was cancelled, unlock it and retry. If the original signing key or configuration was lost, restore the original data; rerunning the installer does not recreate the same private key. Changing to a new identity would be a separate recovery action and can require permission again. The updater never rotates identities automatically.
+
 References: [Apple TN2206: Code signing in depth](https://developer.apple.com/library/archive/technotes/tn2206/) and [Apple TN3127: Code signing requirements](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements).
 
 ### Audio diagnostics

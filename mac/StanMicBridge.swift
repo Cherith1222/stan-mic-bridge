@@ -944,7 +944,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         try LocalSigning.prepareDownloadedApp(at: staged, installedApp: Bundle.main.bundleURL)
                     } catch {
                         DispatchQueue.main.async {
-                            self.updateFailed(detail: "固定本機簽署未完成。請確認登入鑰匙圈已解鎖，並保留設定時建立的簽署憑證與私密金鑰。若身分已遺失，請重新執行一次固定簽署安裝設定後再更新。原本的 App 與連線設定未變更，麥克風可繼續使用。")
+                            self.updateFailed(detail: "固定本機簽署未完成。若剛才取消授權或鑰匙圈仍鎖定，請解鎖登入鑰匙圈後重試。若原本的簽署憑證、私密金鑰或固定簽署設定已遺失，需先還原原始資料；重新執行安裝不會自動更換簽署身分。無法還原時，需要另行處理身分重設，macOS 可能要求重新授權。原本的 App 與連線設定未變更，麥克風可繼續使用。")
                         }
                         return
                     }

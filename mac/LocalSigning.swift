@@ -246,7 +246,7 @@ enum LocalSigning {
         if supplied == nil {
             let installed = fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Applications/Stan Mic Bridge.app")
             if fileManager.fileExists(atPath: installed.path) {
-                try require(try certificateFingerprint(installed) == nil,
+                try require(try certificateFingerprint(installed) == nil && certificateFingerprint(helperURL(installed)) == nil,
                             "The installed app is already certificate-signed but its local configuration is missing. Recover the original identity/configuration instead of creating a replacement identity.")
             }
         }
@@ -299,6 +299,8 @@ enum LocalSigning {
             "-config", openssl.path, "-keyout", key.path, "-out", cert.path], timeout: 60)
         try run("/usr/bin/openssl", ["x509", "-in", cert.path, "-outform", "DER", "-out", der.path])
         let passphrase = UUID().uuidString + UUID().uuidString
+        try Data().write(to: p12)
+        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: p12.path)
         try run("/usr/bin/openssl", ["pkcs12", "-export", "-inkey", key.path, "-in", cert.path,
             "-name", label, "-out", p12.path, "-passout", "stdin"], input: Data((passphrase + "\n").utf8))
         try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: p12.path)
@@ -334,7 +336,9 @@ enum LocalSigning {
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
+        let diagnostics = executable == "/usr/bin/codesign" ? Pipe() : nil
+        if let errorPipe = diagnostics { process.standardError = errorPipe }
+        else { process.standardError = FileHandle.nullDevice }
         let pipe = Pipe()
         process.standardInput = pipe
         try process.run()
@@ -346,9 +350,16 @@ enum LocalSigning {
         }
         if process.isRunning {
             process.terminate()
+            let stopDeadline = ProcessInfo.processInfo.systemUptime + 5
+            while process.isRunning && ProcessInfo.processInfo.systemUptime < stopDeadline { Thread.sleep(forTimeInterval: 0.05) }
+            if process.isRunning { _ = kill(process.processIdentifier, SIGKILL) }
             throw Failure(message: "\(URL(fileURLWithPath: executable).lastPathComponent) timed out. The installed app was retained.")
         }
+        let diagnosticText = diagnostics.map {
+            String(decoding: $0.fileHandleForReading.readDataToEndOfFile().prefix(2048), as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        } ?? ""
         try require(process.terminationStatus == 0,
-                    "\(URL(fileURLWithPath: executable).lastPathComponent) failed or was cancelled (exit \(process.terminationStatus)). The installed app was retained.")
+                    "\(URL(fileURLWithPath: executable).lastPathComponent) failed or was cancelled (exit \(process.terminationStatus)). \(diagnosticText) The installed app was retained.")
     }
 }

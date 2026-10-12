@@ -25,7 +25,7 @@ for arch in "${archs[@]}"; do
     StanMicBridge.swift LocalSigning.swift -o "$stage/StanMicBridge-$arch"
   xcrun swiftc -swift-version 5 -O -target "${arch}-apple-macosx12.0" \
     -framework AppKit -framework Security -framework CryptoKit \
-    UpdateHelper.swift LocalSigning.swift -o "$stage/StanMicUpdater-$arch"
+    UpdateHelper.swift LocalSigning.swift LocalSigningTests.swift -o "$stage/StanMicUpdater-$arch"
   main_binaries+=("$stage/StanMicBridge-$arch")
   helper_binaries+=("$stage/StanMicUpdater-$arch")
 done

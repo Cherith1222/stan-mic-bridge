@@ -29,12 +29,16 @@ app="$stage/Stan Mic Bridge.app"
 mkdir -p "$HOME/Applications"
 bash build-app.command "$stage"
 destination="$HOME/Applications/Stan Mic Bridge.app"
+# Run a separate helper copy so signing the app never rewrites executing code.
+signer="$stage/StanMicSigningHelper"
+cp "$app/Contents/Helpers/StanMicUpdater" "$signer"
+codesign --verify --strict "$signer"
 if [[ "${1:-}" == --local-signing ]]; then
   echo "Setting up or reusing this Mac's fixed signing identity. macOS may ask for Keychain approval."
-  "$app/Contents/Helpers/StanMicUpdater" --setup-local-signing "$app"
+  "$signer" --setup-local-signing "$app"
 else
   # Preserve an existing local identity even when the flag is omitted on a later install.
-  "$app/Contents/Helpers/StanMicUpdater" --prepare-local-signing "$app" "$destination"
+  "$signer" --prepare-local-signing "$app" "$destination"
 fi
 if [[ -e "$destination" ]]; then
   backup="$HOME/Applications/Stan Mic Bridge.backup.$(date +%Y%m%d-%H%M%S).app"

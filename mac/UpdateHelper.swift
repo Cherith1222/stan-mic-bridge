@@ -511,6 +511,9 @@ private func signingSetupStage(_ path: String) throws -> URL {
     try require(path.hasPrefix("/"), "The installer staging app must use an absolute path.")
     let stage = try noSymlinksUnderAnchor(URL(fileURLWithPath: path), anchor: files.temporaryDirectory)
     try require(stage.lastPathComponent == "Stan Mic Bridge.app", "Unexpected installer staging app name.")
+    let executable = try canonicalAnchor(URL(fileURLWithPath: CommandLine.arguments[0]))
+    try require(!executable.path.hasPrefix(stage.path + "/"),
+                "Run a verified copy of the signing helper outside the staging app so it does not re-sign its own running executable.")
     try verify(stage)
     return stage
 }
@@ -520,6 +523,9 @@ static func main() {
 do {
     let arguments = Array(CommandLine.arguments.dropFirst())
     if arguments == ["--self-test"] { try selfTest() }
+    else if arguments.count == 2 && arguments[0] == "--test-local-signing" {
+        try LocalSigningTests.run(app: URL(fileURLWithPath: arguments[1]))
+    }
     else if arguments.count == 2 && arguments[0] == "--setup-local-signing" {
         try LocalSigning.setup(app: signingSetupStage(arguments[1]))
         print("The staging app now uses the pinned local signing identity.")
