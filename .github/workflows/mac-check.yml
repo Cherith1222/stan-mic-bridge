@@ -28,6 +28,7 @@ jobs:
       - name: Verify update policies and rollback without capture
         run: |
           "$RUNNER_TEMP/package/Stan Mic Bridge.app/Contents/MacOS/StanMicBridge" --test-updates
+          "$RUNNER_TEMP/package/Stan Mic Bridge.app/Contents/MacOS/StanMicBridge" --test-update-menu
           "$RUNNER_TEMP/package/Stan Mic Bridge.app/Contents/Helpers/StanMicUpdater" --self-test
           "$RUNNER_TEMP/package/Stan Mic Bridge.app/Contents/Helpers/StanMicUpdater" --test-paths
           "$RUNNER_TEMP/package/Stan Mic Bridge.app/Contents/Helpers/StanMicUpdater" --test-install-paths "$RUNNER_TEMP/package/Stan Mic Bridge.app"

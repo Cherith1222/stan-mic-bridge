@@ -241,9 +241,12 @@ private enum UpdateResume {
 }
 
 private enum UpdateStaging {
+    static var isMenuTest: Bool {
+        CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--test-update-menu"
+    }
     static var isStartupTest: Bool {
         let arguments = CommandLine.arguments
-        return (arguments.count == 3 && arguments[1] == "--test-update-startup")
+        return isMenuTest || (arguments.count == 3 && arguments[1] == "--test-update-startup")
             || (arguments.count == 5 && arguments[1] == "--test-update-resume" && arguments[3] == "--resume-update")
     }
     static func receiptRootName(_ name: String) -> Bool {
@@ -576,6 +579,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var updateSession: URLSession?
     private var updatePanel: NSPanel?
     private var statusMenuVisible = false
+    private var statusMenuOpenCount = 0
     private var menuRevealPending = false
     private var offeredRelease: PublicRelease?
     private var installingUpdate = false
@@ -638,7 +642,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         quit.target = self
         menu.addItem(quit)
         statusItem.menu = menu
-        refreshSigningStatus()
+        if !UpdateStaging.isMenuTest { refreshSigningStatus() }
         if let image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "Stan Mic Bridge") {
             image.isTemplate = true
             statusItem.button?.image = image
@@ -681,6 +685,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if self.enabled { self.scheduleRetry(message: "已喚醒，準備重連") }
         })
         if connection == nil && !UpdateStaging.isStartupTest && !resumeGranted { DispatchQueue.main.async { self.configure() } }
+        if UpdateStaging.isMenuTest { runUpdateMenuSmoke() }
     }
 
     private func show(_ text: String) {
@@ -849,18 +854,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func setUpdateStatus(_ text: String) {
         updateStatusItem.title = text
     }
-    func menuWillOpen(_ menu: NSMenu) { statusMenuVisible = true }
+    func menuWillOpen(_ menu: NSMenu) {
+        statusMenuVisible = true
+        statusMenuOpenCount += 1
+    }
     func menuDidClose(_ menu: NSMenu) { statusMenuVisible = false }
     private func revealUpdateMenu() {
-        guard !menuRevealPending, !UpdateStaging.isStartupTest else { return }
+        guard !menuRevealPending,
+              !UpdateStaging.isStartupTest || UpdateStaging.isMenuTest else { return }
         menuRevealPending = true
-        // Wait until the menu action closes its current tracking session. Do not
-        // click an already visible menu, which would otherwise close it again.
-        DispatchQueue.main.async { [weak self] in
+        // Enter menu tracking from a run-loop timer, never a main GCD block:
+        // synchronous tracking must leave that queue free for network/audio callbacks.
+        let reveal = Timer(timeInterval: 0.01, repeats: false) { [weak self] _ in
             guard let self = self else { return }
             self.menuRevealPending = false
             if !self.statusMenuVisible { self.statusItem.button?.performClick(nil) }
         }
+        RunLoop.main.add(reveal, forMode: .common)
+    }
+    private func runUpdateMenuSmoke() {
+        // Real status-menu tracking, not a simulated state machine. The timeout
+        // is a common-mode timer so it can fail even if the main queue stalls.
+        let timeout = Timer(timeInterval: 5, repeats: false) { _ in
+            fputs("Update menu smoke timed out while tracking\n", stderr)
+            exit(1)
+        }
+        RunLoop.main.add(timeout, forMode: .common)
+        setUpdateStatus("正在檢查更新…")
+        updateItem.isEnabled = false
+        revealUpdateMenu()
+        let completion = Timer(timeInterval: 0.2, repeats: false) { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self = self, self.statusMenuVisible, self.statusMenuOpenCount == 1 else {
+                    fputs("Update menu did not open through the production reveal path\n", stderr)
+                    exit(1)
+                }
+                self.updateItem.isEnabled = true
+                self.setUpdateStatus("已是最新版本（UI 測試）")
+                self.revealUpdateMenu()
+                // Give the production reveal callback a turn while menu tracking
+                // continues: it must not click the already-open menu closed.
+                let validate = Timer(timeInterval: 0.03, repeats: false) { _ in
+                    guard self.statusMenuVisible, self.statusMenuOpenCount == 1,
+                          self.updateStatusItem.title == "已是最新版本（UI 測試）",
+                          self.updateItem.title == "檢查更新…", self.updateItem.isEnabled,
+                          self.updatePanel == nil, self.audioStatusPanel == nil,
+                          NSApp.modalWindow == nil, self.engine == nil, self.updateSession == nil else {
+                        fputs("Update result was not visible during single-menu tracking\n", stderr)
+                        exit(1)
+                    }
+                    self.statusItem.menu?.cancelTracking()
+                    let closed = Timer(timeInterval: 0.05, repeats: false) { _ in
+                        guard !self.statusMenuVisible else {
+                            fputs("Update menu tracking did not close\n", stderr)
+                            exit(1)
+                        }
+                        timeout.invalidate()
+                        print("Real update menu opened once, displayed async result while tracking, and closed; no audio or network used.")
+                        exit(0)
+                    }
+                    RunLoop.main.add(closed, forMode: .common)
+                }
+                RunLoop.main.add(validate, forMode: .common)
+            }
+        }
+        RunLoop.main.add(completion, forMode: .common)
     }
     @objc private func openReleaseHistory() {
         let url = URL(string: "https://github.com/Cherith1222/stan-mic-bridge/releases")!
