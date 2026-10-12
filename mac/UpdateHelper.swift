@@ -251,12 +251,41 @@ private func selfTest() throws {
     }
     print("Updater transaction, startup-readiness, safe-rollback and parent-timeout tests passed.")
 }
+// CI exercises the actual LaunchServices/receipt path with an app that starts
+// stopped. This mode never replaces an installation or starts microphone input.
+private func testStartup(_ path: String) throws {
+    try require(path.hasPrefix("/"), "The startup test requires an absolute app path.")
+    let app = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
+    try verify(app)
+    let build = try bundleBuild(app)
+    let root = files.temporaryDirectory.resolvingSymlinksInPath()
+        .appendingPathComponent("StanMicBridge-update-\(UUID().uuidString)")
+    try files.createDirectory(at: root, withIntermediateDirectories: false,
+                              attributes: [.posixPermissions: 0o700])
+    defer { try? files.removeItem(at: root) }
+    let receipt = root.appendingPathComponent("update-ready.json")
+    let started = Date()
+    do {
+        try run("/usr/bin/open", ["-n", app.path, "--args", "--update-ready", receipt.path])
+        try waitForReadiness(receipt: receipt, build: String(build), alive: { pid in
+            guard kill(pid, 0) == 0, let running = NSRunningApplication(processIdentifier: pid) else { return false }
+            return matchingLaunch(running, destination: app, since: started)
+        })
+    } catch {
+        let startupError = error
+        try stopFailedLaunch(destination: app, since: started)
+        throw startupError
+    }
+    try stopFailedLaunch(destination: app, since: started)
+    print("Real LaunchServices startup receipt and safe termination passed; microphone remained stopped.")
+}
 do {
     let arguments = Array(CommandLine.arguments.dropFirst())
     if arguments == ["--self-test"] { try selfTest() }
+    else if arguments.count == 2 && arguments[0] == "--test-startup" { try testStartup(arguments[1]) }
     else { try install(arguments) }
 } catch {
-    if CommandLine.arguments.contains("--self-test") {
+    if CommandLine.arguments.contains("--self-test") || CommandLine.arguments.contains("--test-startup") {
         fputs("Updater test failed: \(error)\n", stderr)
     } else {
         NSApplication.shared.setActivationPolicy(.accessory)
@@ -269,4 +298,3 @@ do {
     }
     exit(1)
 }
-

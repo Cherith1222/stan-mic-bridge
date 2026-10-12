@@ -23,12 +23,13 @@ jobs:
       - name: Build universal app with signed update helper
         run: |
           bash mac/build-app.command "$RUNNER_TEMP/package" --universal
-          lipo -verify_arch x86_64 arm64 "$RUNNER_TEMP/package/Stan Mic Bridge.app/Contents/MacOS/StanMicBridge"
-          lipo -verify_arch x86_64 arm64 "$RUNNER_TEMP/package/Stan Mic Bridge.app/Contents/Helpers/StanMicUpdater"
+          lipo "$RUNNER_TEMP/package/Stan Mic Bridge.app/Contents/MacOS/StanMicBridge" -verify_arch x86_64 arm64
+          lipo "$RUNNER_TEMP/package/Stan Mic Bridge.app/Contents/Helpers/StanMicUpdater" -verify_arch x86_64 arm64
       - name: Verify update policies and rollback without capture
         run: |
           "$RUNNER_TEMP/package/Stan Mic Bridge.app/Contents/MacOS/StanMicBridge" --test-updates
           "$RUNNER_TEMP/package/Stan Mic Bridge.app/Contents/Helpers/StanMicUpdater" --self-test
+          "$RUNNER_TEMP/package/Stan Mic Bridge.app/Contents/Helpers/StanMicUpdater" --test-startup "$RUNNER_TEMP/package/Stan Mic Bridge.app"
       - name: Package app
         run: |
           cd "$RUNNER_TEMP/package"
