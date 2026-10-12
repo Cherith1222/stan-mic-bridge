@@ -61,18 +61,22 @@ private func canonicalAnchor(_ anchor: URL) throws -> URL {
     defer { free(resolved) }
     return URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
 }
-private func trimmedPath(_ path: String) -> String {
-    var result = path
-    while result.count > 1 && result.hasSuffix("/") { result.removeLast() }
-    return result
+// Repeated separators are harmless POSIX spelling (TMPDIR commonly ends in '/').
+// Reject traversal tokens before constructing a URL or doing any normalization.
+private func normalizedSeparators(_ path: String) throws -> String {
+    try require(path.hasPrefix("/"), "The app path must be absolute.")
+    let components = path.split(separator: "/", omittingEmptySubsequences: true)
+    try require(components.allSatisfy { $0 != "." && $0 != ".." },
+                "The app path contains an invalid path component.")
+    return "/" + components.joined(separator: "/")
 }
 // Only the OS-provided anchor may contain aliases such as /var -> /private/var.
 // Never resolve the candidate: that would hide a link in Applications or staging.
 private func noSymlinksUnderAnchor(_ candidate: URL, anchor: URL) throws -> URL {
     let canonical = try canonicalAnchor(anchor)
-    let canonicalPath = trimmedPath(canonical.path)
-    let rawAnchor = trimmedPath(anchor.path)
-    let candidatePath = trimmedPath(candidate.path)
+    let canonicalPath = try normalizedSeparators(canonical.path)
+    let rawAnchor = try normalizedSeparators(anchor.path)
+    let candidatePath = try normalizedSeparators(candidate.path)
     let spellings = [canonicalPath, rawAnchor].sorted { $0.count > $1.count }
     guard let matched = spellings.first(where: { candidatePath.hasPrefix($0 + "/") }) else {
         throw UpdateError.message("The app path is outside its trusted update directory.")
@@ -342,8 +346,8 @@ private func install(_ arguments: [String]) throws {
     // A reused PID can only cause a bounded timeout, never termination.
     try require(getppid() == parent || getppid() == 1, "The updater was not launched by the expected app.")
     try require(arguments[1].hasPrefix("/") && arguments[2].hasPrefix("/"), "Absolute app paths are required.")
-    let paths = try installationPaths(destination: URL(fileURLWithPath: arguments[2]),
-        staged: URL(fileURLWithPath: arguments[1]), home: files.homeDirectoryForCurrentUser,
+    let paths = try installationPaths(destination: URL(fileURLWithPath: normalizedSeparators(arguments[2])),
+        staged: URL(fileURLWithPath: normalizedSeparators(arguments[1])), home: files.homeDirectoryForCurrentUser,
         temporary: files.temporaryDirectory)
     let destination = paths.destination
     let resolvedStage = paths.staged
@@ -509,7 +513,7 @@ private func testStartup(_ path: String, resume: Bool = false) throws {
 }
 private func signingSetupStage(_ path: String) throws -> URL {
     try require(path.hasPrefix("/"), "The installer staging app must use an absolute path.")
-    let stage = try noSymlinksUnderAnchor(URL(fileURLWithPath: path), anchor: files.temporaryDirectory)
+    let stage = try noSymlinksUnderAnchor(URL(fileURLWithPath: normalizedSeparators(path)), anchor: files.temporaryDirectory)
     try require(stage.lastPathComponent == "Stan Mic Bridge.app", "Unexpected installer staging app name.")
     let executable = try canonicalAnchor(URL(fileURLWithPath: CommandLine.arguments[0]))
     try require(!executable.path.hasPrefix(stage.path + "/"),
@@ -517,12 +521,54 @@ private func signingSetupStage(_ path: String) throws -> URL {
     try verify(stage)
     return stage
 }
+private func testBootstrapPaths(_ source: URL) throws {
+    let temporary = files.temporaryDirectory
+    let name = "stan-mic-bootstrap-test-\(UUID().uuidString)"
+    let root = temporary.appendingPathComponent(name)
+    try files.createDirectory(at: root, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+    defer { try? files.removeItem(at: root) }
+    let staged = root.appendingPathComponent("Stan Mic Bridge.app")
+    try verify(source)
+    try files.copyItem(at: source, to: staged)
+    let raw = temporary.path + "/" + name + "/Stan Mic Bridge.app"
+    let canonical = try canonicalAnchor(temporary).path + "/" + name + "/Stan Mic Bridge.app"
+    let repeated = temporary.path + "///" + name + "//Stan Mic Bridge.app"
+    let repeatedCanonical = try canonicalAnchor(temporary).path + "//" + name + "///Stan Mic Bridge.app"
+    let oldCandidate = URL(fileURLWithPath: repeated).path
+    print("Bootstrap path diagnostic: Foundation retains repeated separators = \(oldCandidate.contains("//"))")
+    let expected = try canonicalAnchor(staged).path
+    for spelling in [raw, canonical, repeated, repeatedCanonical] {
+        try require(try signingSetupStage(spelling).path == expected,
+                    "The bootstrap signing preflight rejected an equivalent separator/anchor spelling.")
+    }
+    print("Bootstrap signing preflight accepted raw/canonical temp anchors and repeated separators.")
+    for traversal in [temporary.path + "/./" + name + "/Stan Mic Bridge.app",
+                      temporary.path + "/" + name + "/../" + name + "/Stan Mic Bridge.app"] {
+        var rejected = false
+        do { _ = try signingSetupStage(traversal) }
+        catch { rejected = String(describing: error).contains("invalid path component") }
+        try require(rejected, "The bootstrap signing preflight accepted a traversal token.")
+    }
+    let saved = root.appendingPathComponent("saved.app")
+    try files.moveItem(at: staged, to: saved)
+    try files.createSymbolicLink(at: staged, withDestinationURL: saved)
+    var rejectedLink = false
+    do { _ = try signingSetupStage(repeated) }
+    catch { rejectedLink = String(describing: error).contains("symbolic link") }
+    try files.removeItem(at: staged)
+    try files.moveItem(at: saved, to: staged)
+    try require(rejectedLink, "The bootstrap signing preflight accepted a staged app symlink.")
+    print("Bootstrap signing preflight rejected traversal and descendant symlinks; no signing identity was accessed.")
+}
 @main
 struct UpdaterMain {
 static func main() {
 do {
     let arguments = Array(CommandLine.arguments.dropFirst())
     if arguments == ["--self-test"] { try selfTest() }
+    else if arguments.count == 2 && arguments[0] == "--test-bootstrap-paths" {
+        try testBootstrapPaths(URL(fileURLWithPath: arguments[1]))
+    }
     else if arguments.count == 2 && arguments[0] == "--test-local-signing" {
         try LocalSigningTests.run(app: URL(fileURLWithPath: arguments[1]))
     }
@@ -533,7 +579,7 @@ do {
     else if arguments.count == 3 && arguments[0] == "--prepare-local-signing" {
         let stage = try signingSetupStage(arguments[1])
         let home = files.homeDirectoryForCurrentUser
-        let supplied = URL(fileURLWithPath: arguments[2])
+        let supplied = URL(fileURLWithPath: try normalizedSeparators(arguments[2]))
         let expected = home.appendingPathComponent("Applications/Stan Mic Bridge.app")
         let canonicalExpected = try canonicalAnchor(home).appendingPathComponent("Applications/Stan Mic Bridge.app")
         try require(supplied.path == expected.path || supplied.path == canonicalExpected.path,
@@ -552,7 +598,10 @@ do {
     else { try install(arguments) }
 } catch {
     if CommandLine.arguments.dropFirst().first?.hasPrefix("--") == true {
-        fputs("Updater test failed: \(error)\n", stderr)
+        let operation = CommandLine.arguments.dropFirst().first ?? ""
+        let prefix = operation == "--setup-local-signing" || operation == "--prepare-local-signing"
+            ? "Local signing setup failed" : "Updater test failed"
+        fputs("\(prefix): \(error)\n", stderr)
     } else {
         NSApplication.shared.setActivationPolicy(.accessory)
         let alert = NSAlert()

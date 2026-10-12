@@ -23,7 +23,8 @@ if pgrep -x StanMicBridge >/dev/null; then
   echo 'Choose Quit from the existing Stan Mic Bridge menu, then run this installer again.' >&2
   exit 3
 fi
-stage="$(mktemp -d "${TMPDIR:-/tmp}/stan-mic-build.XXXXXX")"
+temporary_root="${TMPDIR:-/tmp}"
+stage="$(mktemp -d "${temporary_root%/}/stan-mic-build.XXXXXX")"
 trap 'rm -rf -- "$stage"' EXIT
 app="$stage/Stan Mic Bridge.app"
 destination="$HOME/Applications/Stan Mic Bridge.app"

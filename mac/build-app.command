@@ -10,7 +10,8 @@ app="$output/Stan Mic Bridge.app"
 archs=("$(uname -m)")
 if [[ "${2:-}" == --universal ]]; then archs=(x86_64 arm64); fi
 if [[ $# == 2 && "$2" != --universal ]]; then echo 'Unknown build option.' >&2; exit 1; fi
-stage="$(mktemp -d "${TMPDIR:-/tmp}/stan-mic-compile.XXXXXX")"
+temporary_root="${TMPDIR:-/tmp}"
+stage="$(mktemp -d "${temporary_root%/}/stan-mic-compile.XXXXXX")"
 trap 'rm -rf -- "$stage"' EXIT
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Helpers" "$app/Contents/Resources"
 cp Info.plist "$app/Contents/Info.plist"
