@@ -72,7 +72,7 @@ Set the shortcut's **Start in** to the repository folder. This project does not 
 
 ## 2. Install the native Mac app
 
-Download **StanMicBridge-macOS.zip** from the [latest release](https://github.com/Cherith1222/stan-mic-bridge/releases/latest), extract it, and move **Stan Mic Bridge.app** into `~/Applications`. In Finder, Command+Shift+G opens that folder. Quit an older running version before replacing it. Launch the installed app. The prebuilt app is ad-hoc signed, not Developer ID notarized; if macOS blocks it, review the app's origin and use the system's per-app approval in **Privacy & Security → Open Anyway**. No security settings are changed by the app. [Apple's explanation](https://support.apple.com/102445).
+Download **StanMicBridge-macOS.zip** from the [latest release](https://github.com/stantheman0128/stan-mic-bridge/releases/latest), extract it, and move **Stan Mic Bridge.app** into `~/Applications`. In Finder, Command+Shift+G opens that folder. Quit an older running version before replacing it. Launch the installed app. The prebuilt app is ad-hoc signed, not Developer ID notarized; if macOS blocks it, review the app's origin and use the system's per-app approval in **Privacy & Security → Open Anyway**. No security settings are changed by the app. [Apple's explanation](https://support.apple.com/102445).
 
 Alternatively, clone or download this repository and build locally:
 

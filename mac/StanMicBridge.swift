@@ -117,7 +117,7 @@ private struct PublicRelease: Decodable {
         let matches = (assets ?? []).filter { $0.name == "StanMicBridge-macOS.zip" }
         guard matches.count == 1, let asset = matches.first,
               asset.size > 0, asset.size <= 64 * 1024 * 1024,
-              asset.browser_download_url == "https://github.com/Cherith1222/stan-mic-bridge/releases/download/" + tag_name + "/StanMicBridge-macOS.zip",
+              asset.browser_download_url == "https://github.com/stantheman0128/stan-mic-bridge/releases/download/" + tag_name + "/StanMicBridge-macOS.zip",
               let digest = asset.digest, digest.hasPrefix("sha256:"), digest.count == 71,
               digest.dropFirst(7).allSatisfy({ "0123456789abcdef".contains($0) }) else { return nil }
         return asset
@@ -131,7 +131,7 @@ private struct PublicRelease: Decodable {
         guard stableVersion != nil, let parts = URLComponents(string: html_url),
               parts.scheme == "https", parts.host == "github.com", parts.port == nil,
               parts.user == nil, parts.password == nil, parts.query == nil, parts.fragment == nil,
-              parts.percentEncodedPath == "/Cherith1222/stan-mic-bridge/releases/tag/" + tag_name else { return nil }
+              parts.percentEncodedPath == "/stantheman0128/stan-mic-bridge/releases/tag/" + tag_name else { return nil }
         return parts.url
     }
 }
@@ -417,7 +417,7 @@ private func testUpdatePolicy() {
     for bad in ["1.0", "01.0.0", "1.0.0-beta", "1.0.0+dev", "1.-1.0", "1.0.0/"] {
         precondition(StableVersion(bad) == nil)
     }
-    let canonical = "https://github.com/Cherith1222/stan-mic-bridge/releases/tag/v1.1.0"
+    let canonical = "https://github.com/stantheman0128/stan-mic-bridge/releases/tag/v1.1.0"
     func release(_ url: String, draft: Bool = false, prerelease: Bool = false) -> PublicRelease {
         PublicRelease(tag_name: "v1.1.0", html_url: url, body: nil, draft: draft, prerelease: prerelease)
     }
@@ -427,11 +427,11 @@ private func testUpdatePolicy() {
     for bad in [canonical + "?x=1", canonical + "#x", canonical + "/extra",
                 canonical.replacingOccurrences(of: "https:", with: "http:"),
                 canonical.replacingOccurrences(of: "github.com", with: "github.com.evil.test"),
-                canonical.replacingOccurrences(of: "Cherith1222", with: "someone"),
+                canonical.replacingOccurrences(of: "stantheman0128", with: "someone"),
                 canonical.replacingOccurrences(of: "v1.1.0", with: "v2.0.0")] {
         precondition(release(bad).trustedURL == nil)
     }
-    let downloadURL = "https://github.com/Cherith1222/stan-mic-bridge/releases/download/v1.1.0/StanMicBridge-macOS.zip"
+    let downloadURL = "https://github.com/stantheman0128/stan-mic-bridge/releases/download/v1.1.0/StanMicBridge-macOS.zip"
     func candidate(_ url: String? = nil, digest: String? = "sha256:" + String(repeating: "a", count: 64), size: Int = 1024) -> PublicRelease {
         var value = release(canonical)
         value.assets = [.init(name: "StanMicBridge-macOS.zip", browser_download_url: url ?? downloadURL, digest: digest, size: size)]
@@ -718,7 +718,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         configuration.urlCache = nil
         let client = URLSession(configuration: configuration, delegate: NoRedirectDelegate(), delegateQueue: nil)
         updateSession = client
-        var request = URLRequest(url: URL(string: "https://api.github.com/repos/Cherith1222/stan-mic-bridge/releases/latest")!)
+        var request = URLRequest(url: URL(string: "https://api.github.com/repos/stantheman0128/stan-mic-bridge/releases/latest")!)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
         request.setValue("Stan-Mic-Bridge-Update-Check", forHTTPHeaderField: "User-Agent")
@@ -927,7 +927,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         RunLoop.main.add(completion, forMode: .common)
     }
     @objc private func openReleaseHistory() {
-        let url = URL(string: "https://github.com/Cherith1222/stan-mic-bridge/releases")!
+        let url = URL(string: "https://github.com/stantheman0128/stan-mic-bridge/releases")!
         if !NSWorkspace.shared.open(url) { setUpdateStatus("無法開啟版本紀錄，請重試") }
     }
     @objc private func installUpdate() {
@@ -1361,10 +1361,10 @@ private struct StanMicBridgeMain {
                 let tag = CommandLine.arguments[3]
                 let size = try archive.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
                 var release = PublicRelease(tag_name: tag,
-                    html_url: "https://github.com/Cherith1222/stan-mic-bridge/releases/tag/" + tag,
+                    html_url: "https://github.com/stantheman0128/stan-mic-bridge/releases/tag/" + tag,
                     body: nil, draft: false, prerelease: false)
                 release.assets = [.init(name: "StanMicBridge-macOS.zip",
-                    browser_download_url: "https://github.com/Cherith1222/stan-mic-bridge/releases/download/" + tag + "/StanMicBridge-macOS.zip",
+                    browser_download_url: "https://github.com/stantheman0128/stan-mic-bridge/releases/download/" + tag + "/StanMicBridge-macOS.zip",
                     digest: "sha256:" + CommandLine.arguments[4], size: size)]
                 guard release.installAsset != nil else { throw InstallFailure.invalid }
                 try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
