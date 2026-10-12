@@ -7,8 +7,8 @@
   <key>CFBundleExecutable</key><string>StanMicBridge</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.2.0</string>
-  <key>CFBundleVersion</key><string>4</string>
+  <key>CFBundleShortVersionString</key><string>1.2.1</string>
+  <key>CFBundleVersion</key><string>5</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
   <key>LSUIElement</key><true/>
   <key>NSMicrophoneUsageDescription</key><string>按下開始後，將 Mac 麥克風透過你的私人 Tailscale 連線傳送到 Windows，供遠端語音輸入使用；本程式不儲存錄音。</string>
