@@ -155,12 +155,12 @@ enum LocalSigningTests {
         try LocalSigning.checkCode(second, satisfies: oldRequirement)
         try LocalSigning.require(try LocalSigning.requirementData(oldRequirement) == LocalSigning.requirementData(LocalSigning.designatedRequirement(second)),
                                  "Distinct probe builds changed designated requirement.")
-        try LocalSigning.run(first.path, ["write", config.keychainPath, service])
-        try LocalSigning.run(second.path, ["read", config.keychainPath, service])
+        try LocalSigning.run(first.path, ["write", config.keychainPath, service], captureTestDiagnostics: true)
+        try LocalSigning.run(second.path, ["read", config.keychainPath, service], captureTestDiagnostics: true)
         try FileManager.default.copyItem(at: second, to: wrong)
         try LocalSigning.run("/usr/bin/codesign", ["--force", "--sign", "-", "--identifier", "com.stan.micbridge.signing-probe", wrong.path])
         try expectFailure("a differently signed Keychain reader") {
-            try LocalSigning.run(wrong.path, ["read", config.keychainPath, service])
+            try LocalSigning.run(wrong.path, ["read", config.keychainPath, service], captureTestDiagnostics: true)
         }
         print("Local signing: two distinct signed probe binaries share their own Keychain item; wrong signer denied without prompting.")
     }

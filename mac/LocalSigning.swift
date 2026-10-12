@@ -331,12 +331,13 @@ enum LocalSigning {
         return config
     }
     // Never pass passwords/private keys in command arguments or log tool output.
-    static func run(_ executable: String, _ arguments: [String], input: Data? = nil, timeout: TimeInterval = 30) throws {
+    static func run(_ executable: String, _ arguments: [String], input: Data? = nil, timeout: TimeInterval = 30,
+                    captureTestDiagnostics: Bool = false) throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         process.standardOutput = FileHandle.nullDevice
-        let diagnostics = executable == "/usr/bin/codesign" ? Pipe() : nil
+        let diagnostics = executable == "/usr/bin/codesign" || captureTestDiagnostics ? Pipe() : nil
         if let errorPipe = diagnostics { process.standardError = errorPipe }
         else { process.standardError = FileHandle.nullDevice }
         let pipe = Pipe()
