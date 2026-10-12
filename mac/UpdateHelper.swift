@@ -49,8 +49,24 @@ private func noSymlinks(_ path: URL) throws {
     var current = path.standardizedFileURL
     while current.path != "/" {
         let attributes = try files.attributesOfItem(atPath: current.path)
-        try require(attributes[.type] as? FileAttributeType != .typeSymbolicLink, "A symbolic link was found in the installation path.")
+        try require(attributes[.type] as? FileAttributeType != .typeSymbolicLink, "A symbolic link was found in the installation path: \(current.path)")
         current.deleteLastPathComponent()
+    }
+}
+private func testPaths() throws {
+    let temporary = files.temporaryDirectory
+    let fixture = temporary.appendingPathComponent("StanMicUpdater-path-test-\(UUID().uuidString)")
+    try files.createDirectory(at: fixture, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+    defer { try? files.removeItem(at: fixture) }
+    print("Temporary anchor: \(temporary.path)")
+    print("Resolved anchor: \(temporary.resolvingSymlinksInPath().path)")
+    print("Standardized resolved anchor: \(temporary.resolvingSymlinksInPath().standardizedFileURL.path)")
+    print("Home anchor: \(files.homeDirectoryForCurrentUser.path)")
+    do {
+        try noSymlinks(fixture.resolvingSymlinksInPath())
+        print("Legacy full-ancestor check accepted the real temporary fixture.")
+    } catch {
+        print("LEGACY PATH REPRODUCTION: \(error)")
     }
 }
 private func bundleBuild(_ app: URL) throws -> Int {
@@ -352,11 +368,12 @@ private func testStartup(_ path: String, resume: Bool = false) throws {
 do {
     let arguments = Array(CommandLine.arguments.dropFirst())
     if arguments == ["--self-test"] { try selfTest() }
+    else if arguments == ["--test-paths"] { try testPaths() }
     else if arguments.count == 2 && arguments[0] == "--test-startup" { try testStartup(arguments[1]) }
     else if arguments.count == 2 && arguments[0] == "--test-startup-resume" { try testStartup(arguments[1], resume: true) }
     else { try install(arguments) }
 } catch {
-    if CommandLine.arguments.contains("--self-test") || CommandLine.arguments.contains("--test-startup") || CommandLine.arguments.contains("--test-startup-resume") {
+    if CommandLine.arguments.contains("--self-test") || CommandLine.arguments.contains("--test-paths") || CommandLine.arguments.contains("--test-startup") || CommandLine.arguments.contains("--test-startup-resume") {
         fputs("Updater test failed: \(error)\n", stderr)
     } else {
         NSApplication.shared.setActivationPolicy(.accessory)
