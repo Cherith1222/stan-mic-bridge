@@ -121,10 +121,10 @@ enum LocalSigningTests {
                                     kSecMatchLimit as String: kSecMatchLimitOne, kSecReturnRef as String: true]
         var result: CFTypeRef?
         try LocalSigning.check(SecItemCopyMatching(query as CFDictionary, &result), "Read isolated test identity")
-        guard let result = result, CFGetTypeID(result) == SecIdentityGetTypeID() else {
+        guard let identityResult = result, CFGetTypeID(identityResult) == SecIdentityGetTypeID() else {
             throw LocalSigning.Failure(message: "The isolated identity was not found.")
         }
-        let identity = unsafeBitCast(result, to: SecIdentity.self)
+        let identity = unsafeBitCast(identityResult, to: SecIdentity.self)
         var key: SecKey?
         try LocalSigning.check(SecIdentityCopyPrivateKey(identity, &key), "Read test key attributes")
         guard let privateKey = key, let attributes = SecKeyCopyAttributes(privateKey) as? [String: Any] else {
