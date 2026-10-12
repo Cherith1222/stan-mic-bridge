@@ -30,7 +30,10 @@ enum LocalSigningTests {
         // codesign's certificate/private-key lookup also consults the user's
         // search list, even with --keychain. Unlike the production default
         // keychain, a newly created isolated fixture is not necessarily listed.
-        let alreadyListed = existing.contains { (try? LocalSigning.keychainPath($0)) == (try? LocalSigning.keychainPath(keychain)) }
+        var afterCreation: CFArray?
+        try LocalSigning.check(SecKeychainCopySearchList(&afterCreation), "Inspect the newly created test keychain's search registration")
+        let listedAfterCreation = afterCreation as? [SecKeychain] ?? []
+        let alreadyListed = listedAfterCreation.contains { (try? LocalSigning.keychainPath($0)) == (try? LocalSigning.keychainPath(keychain)) }
         print("Local signing diagnostic: isolated keychain initially in search list = \(alreadyListed)")
         try LocalSigning.check(SecKeychainSetSearchList(([keychain] + existing) as CFArray), "Register only the isolated test keychain")
         // Test processes must fail instead of opening a permission dialog on CI.
