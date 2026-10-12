@@ -179,18 +179,56 @@ private final class ReleaseDownload: NSObject, URLSessionDataDelegate {
     }
 }
 
+private enum UpdateResume {
+    static let preferenceKey = "resumeTransmissionAfterUpdate"
+    struct Intent: Codable { let parentPID: Int32; let build: String; let createdAt: Double }
+    struct Grant: Codable { let build: String; let createdAt: Double; let nonce: String }
+    static func requested(optIn: Bool, transmitting: Bool) -> Bool { optIn && transmitting }
+    static func authorized(grant: Bool, optIn: Bool, credentials: Bool, permission: AVAuthorizationStatus, testMode: Bool) -> Bool {
+        grant && optIn && credentials && permission == .authorized && !testMode
+    }
+    static func fresh(_ timestamp: Double, now: Double) -> Bool {
+        timestamp.isFinite && timestamp <= now + 5 && now - timestamp <= 600
+    }
+    static func writeIntent(root: URL, build: String, parentPID: Int32) throws {
+        let file = root.appendingPathComponent("resume-intent.json")
+        let data = try JSONEncoder().encode(Intent(parentPID: parentPID, build: build, createdAt: Date().timeIntervalSince1970))
+        try data.write(to: file, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+    }
+    // Consume before sending readiness: the helper removes its staging directory
+    // as soon as readiness is confirmed. A normal launch has no grant argument.
+    static func consume(arguments: [String], build: String, now: Double = Date().timeIntervalSince1970) -> Bool {
+        guard arguments.count == 5, ["--update-ready", "--test-update-resume"].contains(arguments[1]), arguments[3] == "--resume-update",
+              arguments[4].count == 64, arguments[4].allSatisfy({ "0123456789abcdef".contains($0) }),
+              let receipt = UpdateStaging.validReceipt(arguments: arguments) else { return false }
+        let file = receipt.deletingLastPathComponent().appendingPathComponent("resume-once.json")
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: file.path),
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              (attributes[.ownerAccountID] as? NSNumber)?.uint32Value == geteuid(),
+              (attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600,
+              ((attributes[.size] as? NSNumber)?.intValue ?? 99999) <= 4096,
+              let data = try? Data(contentsOf: file) else { return false }
+        do { try FileManager.default.removeItem(at: file) } catch { return false }
+        guard let grant = try? JSONDecoder().decode(Grant.self, from: data) else { return false }
+        return grant.build == build && grant.nonce == arguments[4] && fresh(grant.createdAt, now: now)
+    }
+}
+
 private enum UpdateStaging {
     static var isStartupTest: Bool {
-        CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--test-update-startup"
+        let arguments = CommandLine.arguments
+        return (arguments.count == 3 && arguments[1] == "--test-update-startup")
+            || (arguments.count == 5 && arguments[1] == "--test-update-resume" && arguments[3] == "--resume-update")
     }
     static func receiptRootName(_ name: String) -> Bool {
         let prefix = "StanMicBridge-update-"
         return name.hasPrefix(prefix) && UUID(uuidString: String(name.dropFirst(prefix.count))) != nil
     }
-    static func acknowledgeStartup() {
-        let arguments = CommandLine.arguments
-        guard arguments.count == 3,
-              arguments[1] == "--update-ready" || isStartupTest else { return }
+    static func validReceipt(arguments: [String]) -> URL? {
+        guard (arguments.count == 3 || (arguments.count == 5 && arguments[3] == "--resume-update")),
+              arguments[1] == "--update-ready" || (arguments.count == 3 && arguments[1] == "--test-update-startup")
+                || (arguments.count == 5 && arguments[1] == "--test-update-resume") else { return nil }
         let receipt = URL(fileURLWithPath: arguments[2]).standardizedFileURL
         let root = receipt.deletingLastPathComponent()
         let temporary = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().standardizedFileURL
@@ -201,9 +239,14 @@ private enum UpdateStaging {
               attributes[.type] as? FileAttributeType == .typeDirectory,
               (attributes[.ownerAccountID] as? NSNumber)?.uint32Value == geteuid(),
               (attributes[.posixPermissions] as? NSNumber)?.intValue == 0o700,
-              (try? FileManager.default.attributesOfItem(atPath: receipt.path)) == nil,
+              (try? FileManager.default.attributesOfItem(atPath: receipt.path)) == nil else { return nil }
+        return receipt
+    }
+    static func acknowledgeStartup(resumeGranted: Bool) {
+        guard let receipt = validReceipt(arguments: CommandLine.arguments),
               let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
-              let data = try? JSONSerialization.data(withJSONObject: ["pid": ProcessInfo.processInfo.processIdentifier, "build": build] as [String: Any]) else { return }
+              let data = try? JSONSerialization.data(withJSONObject: ["pid": ProcessInfo.processInfo.processIdentifier, "build": build,
+                  "resumeGrantConsumed": resumeGranted] as [String: Any]) else { return }
         try? data.write(to: receipt, options: .atomic)
     }
     static func command(_ path: String, _ arguments: [String]) throws -> String {
@@ -280,6 +323,45 @@ private enum MicrophoneAuthorizationAction: Equatable {
 }
 
 private func testUpdatePolicy() {
+    precondition(!UpdateResume.requested(optIn: false, transmitting: true))
+    precondition(!UpdateResume.requested(optIn: true, transmitting: false)) // Stop during download.
+    precondition(UpdateResume.requested(optIn: true, transmitting: true))
+    precondition(UpdateResume.authorized(grant: true, optIn: true, credentials: true, permission: .authorized, testMode: false))
+    precondition(!UpdateResume.authorized(grant: false, optIn: true, credentials: true, permission: .authorized, testMode: false))
+    precondition(!UpdateResume.authorized(grant: true, optIn: false, credentials: true, permission: .authorized, testMode: false))
+    precondition(!UpdateResume.authorized(grant: true, optIn: true, credentials: false, permission: .authorized, testMode: false))
+    precondition(!UpdateResume.authorized(grant: true, optIn: true, credentials: true, permission: .authorized, testMode: true))
+    for permission in [AVAuthorizationStatus.notDetermined, .denied, .restricted] {
+        precondition(!UpdateResume.authorized(grant: true, optIn: true, credentials: true, permission: permission, testMode: false))
+    }
+    do {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("StanMicBridge-update-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: root) }
+        let grantFile = root.appendingPathComponent("resume-once.json")
+        let nonce = String(repeating: "a", count: 64)
+        let arguments = ["app", "--update-ready", root.appendingPathComponent("update-ready.json").path, "--resume-update", nonce]
+        func seed(build: String = "6", timestamp: Double = 1000) throws {
+            try JSONEncoder().encode(UpdateResume.Grant(build: build, createdAt: timestamp, nonce: nonce)).write(to: grantFile)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: grantFile.path)
+        }
+        try seed()
+        precondition(!UpdateResume.consume(arguments: ["app"], build: "6", now: 1000))
+        precondition(!UpdateResume.consume(arguments: Array(arguments.prefix(3)), build: "6", now: 1000)) // Old helper.
+        precondition(UpdateResume.consume(arguments: arguments, build: "6", now: 1000))
+        precondition(!UpdateResume.consume(arguments: arguments, build: "6", now: 1000)) // One shot.
+        try seed(build: "5")
+        precondition(!UpdateResume.consume(arguments: arguments, build: "6", now: 1000))
+        precondition(!FileManager.default.fileExists(atPath: grantFile.path))
+        try seed(timestamp: 399)
+        precondition(!UpdateResume.consume(arguments: arguments, build: "6", now: 1000))
+        try seed(timestamp: 1006)
+        precondition(!UpdateResume.consume(arguments: arguments, build: "6", now: 1000))
+        try seed()
+        var wrongNonce = arguments
+        wrongNonce[4] = String(repeating: "b", count: 64)
+        precondition(!UpdateResume.consume(arguments: wrongNonce, build: "6", now: 1000))
+    } catch { preconditionFailure("Update resume file-boundary tests failed: \(error)") }
     // Granted access never enters the permission-request path; a refusal never
     // triggers another request. Only macOS's undetermined state may prompt.
     precondition(MicrophoneAuthorizationAction.action(for: .authorized) == .connect)
@@ -392,6 +474,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let configureItem = NSMenuItem(title: "設定連線…", action: #selector(configure), keyEquivalent: "")
     private let forgetItem = NSMenuItem(title: "清除已儲存的連線…", action: #selector(forget), keyEquivalent: "")
     private let updateItem = NSMenuItem(title: "檢查更新…", action: #selector(checkUpdates), keyEquivalent: "")
+    private let resumeUpdateItem = NSMenuItem(title: "更新後自動恢復傳送", action: #selector(toggleUpdateResume), keyEquivalent: "")
     private var updateSession: URLSession?
     private var updatePanel: NSPanel?
     private var offeredRelease: PublicRelease?
@@ -432,6 +515,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         updateItem.target = self
         menu.addItem(updateItem)
+        resumeUpdateItem.target = self
+        resumeUpdateItem.state = UserDefaults.standard.bool(forKey: UpdateResume.preferenceKey) ? .on : .off
+        menu.addItem(resumeUpdateItem)
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "結束 Stan Mic Bridge", action: #selector(quitApp), keyEquivalent: "q")
         quit.target = self
@@ -442,12 +528,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.button?.image = image
             statusItem.button?.imagePosition = .imageLeading
         }
-        // Confirm menu construction before Keychain access can display a system prompt.
-        UpdateStaging.acknowledgeStartup()
+        let resumeGranted = UpdateResume.consume(arguments: CommandLine.arguments,
+            build: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "")
+        // Consume the one-shot grant before readiness lets the helper clean up.
+        UpdateStaging.acknowledgeStartup(resumeGranted: resumeGranted)
+        let startupGeneration = generation
         // The explicit UI smoke-test mode exercises the real menu and receipt
         // without requiring a CI login Keychain or blocking on onboarding.
         connection = UpdateStaging.isStartupTest ? nil : Credentials.load()
         show(connection == nil ? "請先設定連線" : "已停止")
+        if resumeGranted {
+            let permission = AVCaptureDevice.authorizationStatus(for: .audio)
+            if generation == startupGeneration && UpdateResume.authorized(grant: true, optIn: UserDefaults.standard.bool(forKey: UpdateResume.preferenceKey),
+                                       credentials: connection != nil, permission: permission, testMode: UpdateStaging.isStartupTest) {
+                enabled = true
+                failures = 0
+                connect()
+            } else if connection == nil {
+                show("更新完成；請先設定連線，再手動開始")
+            } else if permission != .authorized {
+                show("更新完成；請手動開始並確認麥克風權限")
+            }
+        }
         let center = NSWorkspace.shared.notificationCenter
         workspaceObservers.append(center.addObserver(forName: NSWorkspace.willSleepNotification,
                                                      object: nil, queue: .main) { [weak self] _ in
@@ -462,7 +564,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.sleeping = false
             if self.enabled { self.scheduleRetry(message: "已喚醒，準備重連") }
         })
-        if connection == nil && !UpdateStaging.isStartupTest { DispatchQueue.main.async { self.configure() } }
+        if connection == nil && !UpdateStaging.isStartupTest && !resumeGranted { DispatchQueue.main.async { self.configure() } }
     }
 
     private func show(_ text: String) {
@@ -541,7 +643,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.showUpdate("新版尚未準備完成", "最新版本：\(release.tag_name)\n\n此版本尚未提供可驗證的 App 安裝包，請稍後重新檢查。")
                     return
                 }
-                self.showUpdate("有新版本可用", "目前版本：\(currentText)\n最新版本：\(release.tag_name)\n\n\(notes)\n\n下載與驗證時可繼續收音。安裝時會停止傳送並重新開啟 App；重開後請手動開始傳送。連線設定會保留。", release: release)
+                self.showUpdate("有新版本可用", "目前版本：\(currentText)\n最新版本：\(release.tag_name)\n\n\(notes)\n\n下載與驗證時可繼續收音。安裝時會停止傳送並重新開啟 App。\(self.updateResumeDescription)連線設定會保留。", release: release)
             }
         }.resume()
     }
@@ -583,6 +685,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func closeUpdatePanel() { updatePanel?.close() }
+    private var updateResumeDescription: String {
+        if UserDefaults.standard.bool(forKey: UpdateResume.preferenceKey) {
+            return "已啟用更新後恢復：只有安裝前仍在傳送且權限有效時才會恢復。下載時按停止或取消勾選即可取消恢復。"
+        }
+        return "更新後保持停止；請手動開始傳送。"
+    }
+    @objc private func toggleUpdateResume() {
+        let enabled = !UserDefaults.standard.bool(forKey: UpdateResume.preferenceKey)
+        UserDefaults.standard.set(enabled, forKey: UpdateResume.preferenceKey)
+        resumeUpdateItem.state = enabled ? .on : .off
+        if installingUpdate {
+            showUpdate("更新進行中", "下載與驗證尚未完成。" + updateResumeDescription)
+        } else if let release = offeredRelease {
+            showUpdate("有新版本可用", "最新版本：\(release.tag_name)\n\n\(String((release.body ?? "").prefix(6000)))\n\n" + updateResumeDescription, release: release)
+        }
+    }
     @objc private func installUpdate() {
         guard !installingUpdate, updateSession == nil, let release = offeredRelease,
               let asset = release.installAsset, let url = URL(string: asset.browser_download_url) else { return }
@@ -600,7 +718,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installingUpdate = true
         updateItem.isEnabled = false
         updateItem.title = "正在下載更新…"
-        showUpdate("正在下載更新", "下載與驗證完成後會安裝並重新開啟 App。這段期間仍可傳送麥克風；結束 App 可取消下載。")
+        showUpdate("正在下載更新", "下載與驗證完成後會安裝並重新開啟 App。這段期間仍可傳送麥克風；結束 App 可取消下載。" + updateResumeDescription)
         let downloader = ReleaseDownload(size: asset.size)
         let configuration = URLSessionConfiguration.ephemeral
         configuration.httpCookieStorage = nil
@@ -631,6 +749,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         let process = Process()
                         process.executableURL = helper
                         process.arguments = [String(ProcessInfo.processInfo.processIdentifier), staged.path, destination.path]
+                        // Decide only now, after download/validation; an intervening
+                        // Stop or opt-out must never be replaced by an earlier snapshot.
+                        if UpdateResume.requested(optIn: UserDefaults.standard.bool(forKey: UpdateResume.preferenceKey), transmitting: self.enabled && self.ready),
+                           let build = Bundle(url: staged)?.object(forInfoDictionaryKey: "CFBundleVersion") as? String {
+                            do { try UpdateResume.writeIntent(root: root, build: build, parentPID: ProcessInfo.processInfo.processIdentifier) }
+                            catch { self.updateFailed(); return }
+                        }
                         do { try process.run() }
                         catch { self.updateFailed(); return }
                         self.installerHandoff = true

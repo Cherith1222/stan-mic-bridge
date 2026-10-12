@@ -98,17 +98,27 @@ Choose **停止傳送** (Stop) to stop recording and restore Windows microphone 
 
 In **System Settings → General → Login Items** (or **Login Items & Extensions**), add `~/Applications/Stan Mic Bridge.app` to **Open at Login**. In the file picker, press Command+Shift+G and enter `~/Applications` if needed. On macOS Monterey, use **System Preferences → Users & Groups → Login Items** instead. [Apple's instructions](https://support.apple.com/guide/mac-help/open-items-automatically-when-you-log-in-mh15189/mac).
 
-This opens the menu bar app after login. **Each new launch starts stopped; click Start to transmit.** It does not enable unattended recording. An enabled session can reconnect after sleep/wake, but the Mac cannot send while asleep or powered off.
+This opens the menu bar app after login. **Normal launches, including login and manual reopening, start stopped; click Start to transmit.** The optional update-only resume setting below does not change login behavior. An enabled session can reconnect after sleep/wake, but the Mac cannot send while asleep or powered off.
 
 ### Check for updates
 
 Choose **檢查更新…** (Check for updates) in the Mic menu. The app contacts this project's public GitHub Releases API only when clicked, compares the latest stable version, and displays its release notes. Checking does not stop recording and does not send your microphone connection credentials to GitHub.
 
-For a newer version, choose **下載並安裝更新** (Download and install update). The app downloads the prebuilt ZIP, verifies the GitHub-provided SHA-256 digest, archive structure, bundle identity/version, and code signature, then stops transmission, installs, and reopens stopped. There is no Terminal or local compilation involved. Downloads and validation leave existing transmission running; quitting the app before installation cancels the update. Only installation at `~/Applications/Stan Mic Bridge.app` is supported.
+For a newer version, choose **下載並安裝更新** (Download and install update). The app downloads the prebuilt ZIP, verifies the GitHub-provided SHA-256 digest, archive structure, bundle identity/version, and code signature, then stops transmission, installs, and reopens. By default it reopens stopped. There is no Terminal or local compilation involved. Downloads and validation leave existing transmission running; quitting the app before installation cancels the update. Only installation at `~/Applications/Stan Mic Bridge.app` is supported.
+
+Starting in 1.2.2, **更新後自動恢復傳送** (Resume transmission after update) is an optional menu setting, off by default. When enabled, an update may resume only if transmission is still active with a ready receiver at installation handoff. Stopping transmission or turning the option off during download prevents resumption; a session still connecting, retrying, or awaiting microphone permission does not qualify. The request applies only to that update launch, requires saved connection credentials and existing microphone authorization, and is consumed once. Normal relaunch, login, and crash recovery never use it. If macOS requires microphone authorization again, the app remains stopped and asks you to use Start. Updating from 1.2.1 into 1.2.2 still starts stopped; enable the option in 1.2.2 for subsequent updates.
 
 An independent helper waits for the old app to exit, preserves its bundle as a backup, and verifies that the new app reaches its UI startup checkpoint. Replacement and startup failures trigger restoration where safe; if an unresponsive new process cannot be stopped, the helper leaves the backup intact and explains how to restore it instead of modifying a running app. Startup readiness does not prove microphone or network functionality. The helper does not touch Keychain, so connection data is retained. macOS may ask again for microphone or Keychain authorization after an update.
 
-Versions before 1.2.0 need one manual upgrade (Finder replacement or source installer) before in-app installation is available. There are no scheduled checks, silent installations, or automatic recording after updates. Missing or invalid release assets are refused rather than installed.
+Versions before 1.2.0 need one manual upgrade (Finder replacement or source installer) before in-app installation is available. There are no scheduled checks or silent installations. Automatic transmission after an update requires the explicit option and the conditions above. Missing or invalid release assets are refused rather than installed.
+
+### Signing identity and repeated permission prompts
+
+The current release packages use ad-hoc signing. Their designated requirements are tied to a particular build, so updates can cause macOS to ask again for microphone or Keychain access. An auto-resume preference cannot grant those permissions.
+
+A paid Developer ID is not the only way to establish a stable code identity for personal use. Apple documents that a persistent self-signed code-signing identity can provide stable designated requirements, including for Keychain access. Every update must use that same identity; signing just one installation and then replacing it with an ad-hoc release loses that continuity. This is distinct from Developer ID notarization and does not remove Gatekeeper checks. Microphone-permission retention must still be verified across updates on the target macOS installation. The current updater does not re-sign downloads with a local certificate.
+
+References: [Apple TN2206: Code signing in depth](https://developer.apple.com/library/archive/technotes/tn2206/) and [Apple TN3127: Code signing requirements](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements).
 
 ## Browser alternative
 

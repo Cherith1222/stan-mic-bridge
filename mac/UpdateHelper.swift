@@ -8,6 +8,30 @@ private enum UpdateError: Error, CustomStringConvertible {
     var description: String { if case .message(let text) = self { return text }; return "Update failed" }
 }
 private let files = FileManager.default
+private struct ResumeIntent: Codable { let parentPID: Int32; let build: String; let createdAt: Double }
+private struct ResumeGrant: Codable { let build: String; let createdAt: Double; let nonce: String }
+private func consumeResumeIntent(root: URL, parent: Int32, build: String, now: Double = Date().timeIntervalSince1970) -> Bool {
+    let file = root.appendingPathComponent("resume-intent.json")
+    guard let attributes = try? files.attributesOfItem(atPath: file.path),
+          attributes[.type] as? FileAttributeType == .typeRegular,
+          (attributes[.ownerAccountID] as? NSNumber)?.uint32Value == geteuid(),
+          (attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600,
+          ((attributes[.size] as? NSNumber)?.intValue ?? 99999) <= 4096,
+          let data = try? Data(contentsOf: file) else { return false }
+    do { try files.removeItem(at: file) } catch { return false }
+    guard let intent = try? JSONDecoder().decode(ResumeIntent.self, from: data) else { return false }
+    return intent.parentPID == parent && intent.build == build && intent.createdAt.isFinite
+        && intent.createdAt <= now + 5 && now - intent.createdAt <= 600
+}
+private func createResumeGrant(root: URL, build: String) throws -> String {
+    let nonce = (UUID().uuidString + UUID().uuidString).replacingOccurrences(of: "-", with: "").lowercased()
+    let file = root.appendingPathComponent("resume-once.json")
+    try require((try? files.attributesOfItem(atPath: file.path)) == nil, "An update resume grant already exists.")
+    let data = try JSONEncoder().encode(ResumeGrant(build: build, createdAt: Date().timeIntervalSince1970, nonce: nonce))
+    try data.write(to: file, options: .atomic)
+    try files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+    return nonce
+}
 private func require(_ condition: Bool, _ message: String) throws {
     if !condition { throw UpdateError.message(message) }
 }
@@ -76,6 +100,7 @@ private func replace(destination: URL, incoming: URL, backup: URL,
 private struct ReadyReceipt: Decodable {
     let pid: Int32
     let build: String
+    let resumeGrantConsumed: Bool?
 }
 private func waitForReadiness(receipt: URL, build: String, timeout: TimeInterval = 30,
                               alive: (Int32) -> Bool) throws {
@@ -176,6 +201,9 @@ private func install(_ arguments: [String]) throws {
     let oldBuild = try bundleBuild(destination)
     let newBuild = try bundleBuild(resolvedStage)
     try require(newBuild > oldBuild, "The downloaded app is not a newer build.")
+    // Older helpers ignore this optional intent and launch stopped. Never infer
+    // permission to capture from a persisted preference alone.
+    let resumeRequested = consumeResumeIntent(root: stagingRoot, parent: parent, build: String(newBuild))
     try waitForParent(parent)
     try noSymlinks(destination)
     try require(try bundleBuild(destination) == oldBuild, "The installed app changed during the update. Please retry.")
@@ -193,7 +221,11 @@ private func install(_ arguments: [String]) throws {
                 launch: { app in
                     let started = Date()
                     launchTime = started
-                    try run("/usr/bin/open", ["-n", app.path, "--args", "--update-ready", receipt.path])
+                    var launchArguments = ["-n", app.path, "--args", "--update-ready", receipt.path]
+                    if resumeRequested {
+                        launchArguments += ["--resume-update", try createResumeGrant(root: stagingRoot, build: String(newBuild))]
+                    }
+                    try run("/usr/bin/open", launchArguments)
                     try waitForReadiness(receipt: receipt, build: String(newBuild), alive: { pid in
                         guard kill(pid, 0) == 0, let running = NSRunningApplication(processIdentifier: pid) else { return false }
                         return matchingLaunch(running, destination: app, since: started)
@@ -215,6 +247,17 @@ private func selfTest() throws {
     let root = files.temporaryDirectory.appendingPathComponent("StanMicUpdater-test-\(UUID().uuidString)")
     try files.createDirectory(at: root, withIntermediateDirectories: true)
     defer { try? files.removeItem(at: root) }
+    let intentPath = root.appendingPathComponent("resume-intent.json")
+    for sample in [ResumeIntent(parentPID: 123, build: "6", createdAt: 1000),
+                   ResumeIntent(parentPID: 124, build: "6", createdAt: 1000),
+                   ResumeIntent(parentPID: 123, build: "5", createdAt: 1000),
+                   ResumeIntent(parentPID: 123, build: "6", createdAt: 399)] {
+        try JSONEncoder().encode(sample).write(to: intentPath)
+        try files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: intentPath.path)
+        let accepted = consumeResumeIntent(root: root, parent: 123, build: "6", now: 1000)
+        try require(accepted == (sample.parentPID == 123 && sample.build == "6" && sample.createdAt == 1000), "Resume intent boundary check failed.")
+        try require(!consumeResumeIntent(root: root, parent: 123, build: "6", now: 1000), "A resume intent could be replayed.")
+    }
     for failure in [0, 2, 3, 4, 5] {
         let caseRoot = root.appendingPathComponent("case-\(failure)")
         try files.createDirectory(at: caseRoot, withIntermediateDirectories: true)
@@ -266,7 +309,7 @@ private func selfTest() throws {
 }
 // CI exercises the actual LaunchServices/receipt path with an app that starts
 // stopped. This mode never replaces an installation or starts microphone input.
-private func testStartup(_ path: String) throws {
+private func testStartup(_ path: String, resume: Bool = false) throws {
     try require(path.hasPrefix("/"), "The startup test requires an absolute app path.")
     let app = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
     try verify(app)
@@ -279,11 +322,25 @@ private func testStartup(_ path: String) throws {
     let receipt = root.appendingPathComponent("update-ready.json")
     let started = Date()
     do {
-        try run("/usr/bin/open", ["-n", app.path, "--args", "--test-update-startup", receipt.path])
+        var launchArguments = ["-n", app.path, "--args", "--test-update-startup", receipt.path]
+        if resume {
+            let intentFile = root.appendingPathComponent("resume-intent.json")
+            let intent = ResumeIntent(parentPID: getpid(), build: String(build), createdAt: Date().timeIntervalSince1970)
+            try JSONEncoder().encode(intent).write(to: intentFile, options: .atomic)
+            try files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: intentFile.path)
+            try require(consumeResumeIntent(root: root, parent: getpid(), build: String(build)), "The helper rejected the valid resume intent.")
+            try require(!consumeResumeIntent(root: root, parent: getpid(), build: String(build)), "A consumed resume intent was reused.")
+            launchArguments = ["-n", app.path, "--args", "--test-update-resume", receipt.path,
+                               "--resume-update", try createResumeGrant(root: root, build: String(build))]
+        }
+        try run("/usr/bin/open", launchArguments)
         try waitForReadiness(receipt: receipt, build: String(build), alive: { pid in
             guard kill(pid, 0) == 0, let running = NSRunningApplication(processIdentifier: pid) else { return false }
             return matchingLaunch(running, destination: app, since: started)
         })
+        let result = try JSONDecoder().decode(ReadyReceipt.self, from: Data(contentsOf: receipt))
+        try require(result.resumeGrantConsumed == resume, "The app did not report the expected one-shot resume consumption.")
+        try require(!files.fileExists(atPath: root.appendingPathComponent("resume-once.json").path), "The one-shot resume grant was not consumed.")
     } catch {
         let startupError = error
         try stopFailedLaunch(destination: app, since: started)
@@ -296,9 +353,10 @@ do {
     let arguments = Array(CommandLine.arguments.dropFirst())
     if arguments == ["--self-test"] { try selfTest() }
     else if arguments.count == 2 && arguments[0] == "--test-startup" { try testStartup(arguments[1]) }
+    else if arguments.count == 2 && arguments[0] == "--test-startup-resume" { try testStartup(arguments[1], resume: true) }
     else { try install(arguments) }
 } catch {
-    if CommandLine.arguments.contains("--self-test") || CommandLine.arguments.contains("--test-startup") {
+    if CommandLine.arguments.contains("--self-test") || CommandLine.arguments.contains("--test-startup") || CommandLine.arguments.contains("--test-startup-resume") {
         fputs("Updater test failed: \(error)\n", stderr)
     } else {
         NSApplication.shared.setActivationPolicy(.accessory)
