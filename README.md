@@ -13,6 +13,7 @@ Windows receiver → VB-CABLE → Windows default microphone → your app
 ## Features
 
 - Native Mac sender with Start, Stop, connection status, and automatic reconnect.
+- App icon for Finder/login items and a microphone symbol in the menu bar.
 - Close Chrome and Terminal while the menu bar app keeps running.
 - Save the connection once in macOS Keychain; no repeated token entry.
 - Manually check GitHub releases from the menu, then choose whether to open the update instructions.
@@ -78,6 +79,10 @@ bash mac/install.command
 ```
 
 The installer builds with Apple Swift, locally signs the app, and installs `~/Applications/Stan Mic Bridge.app`. It preserves an older installation as a dated backup and asks you to quit a running copy before upgrading. No Homebrew or third-party Mac runtime is needed. A rebuilt app may prompt again for microphone or Keychain access.
+
+The app checks the existing microphone authorization before starting. It requests access only when the system reports that permission has not been decided; an already-authorized Start goes directly to connection. Login startup, microphone permission, and Keychain access are separate settings. Stopping and starting the same installation should reuse its permission. Because this installer uses ad-hoc signing, a rebuilt version has a different code identity and macOS may ask again after an upgrade. This does not mean every Start requires approval. [Apple's code-signing requirements](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements).
+
+The icon is generated reproducibly from `mac/GenerateIcon.swift` using AppKit and packaged as `AppIcon.icns` before signing. No external image download is required.
 
 1. Click **Mic** in the menu bar and choose **設定連線…** (Configure connection).
 2. Paste your private `https://…/#token=…` link and save it in Keychain.

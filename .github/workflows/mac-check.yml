@@ -28,3 +28,15 @@ jobs:
           done
       - name: Verify release policy without starting capture
         run: '"$RUNNER_TEMP/StanMicBridge-x86_64" --test-updates'
+      - name: Generate and validate app icon
+        run: |
+          xcrun swiftc -swift-version 5 -framework AppKit mac/GenerateIcon.swift -o "$RUNNER_TEMP/GenerateIcon"
+          "$RUNNER_TEMP/GenerateIcon" "$RUNNER_TEMP/AppIcon.iconset"
+          iconutil -c icns "$RUNNER_TEMP/AppIcon.iconset" -o "$RUNNER_TEMP/AppIcon.icns"
+          test -s "$RUNNER_TEMP/AppIcon.icns"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-icon
+          path: |
+            ${{ runner.temp }}/AppIcon.icns
+            ${{ runner.temp }}/AppIcon.iconset/icon_512x512@2x.png

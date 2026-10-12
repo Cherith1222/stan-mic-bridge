@@ -116,7 +116,27 @@ private struct PublicRelease: Decodable {
     }
 }
 
+private enum MicrophoneAuthorizationAction: Equatable {
+    case connect, request, denied, restricted
+
+    static func action(for status: AVAuthorizationStatus) -> Self {
+        switch status {
+        case .authorized: return .connect
+        case .notDetermined: return .request
+        case .denied: return .denied
+        case .restricted: return .restricted
+        @unknown default: return .restricted
+        }
+    }
+}
+
 private func testUpdatePolicy() {
+    // Granted access never enters the permission-request path; a refusal never
+    // triggers another request. Only macOS's undetermined state may prompt.
+    precondition(MicrophoneAuthorizationAction.action(for: .authorized) == .connect)
+    precondition(MicrophoneAuthorizationAction.action(for: .notDetermined) == .request)
+    precondition(MicrophoneAuthorizationAction.action(for: .denied) == .denied)
+    precondition(MicrophoneAuthorizationAction.action(for: .restricted) == .restricted)
     precondition(StableVersion("1.9.0")! < StableVersion("1.10.0")!)
     precondition(StableVersion("v1.1.0")! == StableVersion("1.1.0")!)
     precondition(StableVersion("2.0.0")! > StableVersion("1.99.99")!)
@@ -137,7 +157,7 @@ private func testUpdatePolicy() {
                 canonical.replacingOccurrences(of: "v1.1.0", with: "v2.0.0")] {
         precondition(release(bad).trustedURL == nil)
     }
-    print("Update policy checks passed")
+    print("Update and microphone authorization policy checks passed")
 }
 
 private final class AudioMailbox {
@@ -238,6 +258,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         quit.target = self
         menu.addItem(quit)
         statusItem.menu = menu
+        if let image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "Stan Mic Bridge") {
+            image.isTemplate = true
+            statusItem.button?.image = image
+            statusItem.button?.imagePosition = .imageLeading
+        }
         connection = Credentials.load()
         show(connection == nil ? "請先設定連線" : "已停止")
         let center = NSWorkspace.shared.notificationCenter
@@ -262,6 +287,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stateItem.isEnabled = false
         statusItem.button?.title = ready ? "Mic ●" : (enabled ? "Mic …" : "Mic ○")
         statusItem.button?.toolTip = "Stan Mic Bridge — " + text
+        statusItem.button?.setAccessibilityLabel("Stan Mic Bridge — " + text)
         startItem.isEnabled = !enabled && connection != nil
         stopItem.isEnabled = enabled
         configureItem.isEnabled = !enabled
@@ -433,20 +459,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !enabled, connection != nil else { return }
         enabled = true
         failures = 0
+        switch MicrophoneAuthorizationAction.action(for: AVCaptureDevice.authorizationStatus(for: .audio)) {
+        case .connect:
+            connect()
+        case .request:
+            requestMicrophoneAccess()
+        case .denied:
+            microphoneUnavailable(restricted: false)
+        case .restricted:
+            microphoneUnavailable(restricted: true)
+        }
+    }
+
+    private func microphoneUnavailable(restricted: Bool) {
+        stop()
+        show(restricted ? "麥克風存取受系統限制" : "麥克風權限未開啟")
+        message(restricted ? "麥克風存取受限制" : "需要麥克風權限",
+                restricted
+                ? "此 Mac 的系統政策限制了麥克風存取，請確認裝置管理或家長監護設定。"
+                : "請在系統設定的「隱私權與安全性 → 麥克風」允許 Stan Mic Bridge，再按開始。若系統要求重新開啟程式，請先結束再開啟。")
+    }
+
+    private func requestMicrophoneAccess() {
         show("等待麥克風權限")
         let epoch = generation
         AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
             DispatchQueue.main.async {
                 guard let self = self, self.enabled, self.generation == epoch else { return }
                 guard granted else {
-                    self.stop()
-                    self.show("麥克風權限未開啟")
-                    self.message("需要麥克風權限", "請在系統設定的「隱私權與安全性 → 麥克風」允許 Stan Mic Bridge，再按開始。")
+                    self.microphoneUnavailable(restricted: AVCaptureDevice.authorizationStatus(for: .audio) == .restricted)
                     return
                 }
-                // Prevent App Nap while explicitly enabled, without preventing sleep.
-                self.activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiatedAllowingIdleSystemSleep],
-                                                                       reason: "Live microphone transmission")
                 self.connect()
             }
         }
