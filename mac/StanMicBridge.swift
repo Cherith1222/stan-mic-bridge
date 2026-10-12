@@ -904,11 +904,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         exit(1)
                     }
                     self.statusItem.menu?.cancelTracking()
-                    let closed = Timer(timeInterval: 0.05, repeats: false) { _ in
-                        guard !self.statusMenuVisible else {
+                    // AppKit may finish its dismissal animation after cancelTracking
+                    // returns. Wait for menuDidClose, with a bounded common-mode poll.
+                    let closeDeadline = ProcessInfo.processInfo.systemUptime + 2
+                    let closed = Timer(timeInterval: 0.05, repeats: true) { timer in
+                        if self.statusMenuVisible {
+                            guard ProcessInfo.processInfo.systemUptime >= closeDeadline else { return }
+                            timer.invalidate()
                             fputs("Update menu tracking did not close\n", stderr)
                             exit(1)
                         }
+                        timer.invalidate()
                         timeout.invalidate()
                         print("Real update menu opened once, displayed async result while tracking, and closed; no audio or network used.")
                         exit(0)
