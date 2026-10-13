@@ -11,7 +11,11 @@ enum LocalSigningTests {
         let root = files.temporaryDirectory.appendingPathComponent("StanMicBridge-signing-test-\(UUID().uuidString)")
         try files.createDirectory(at: root, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         defer { try? files.removeItem(at: root) }
-        let keychainURL = root.appendingPathComponent("test.keychain-db")
+        // securityd upgrades keychains to partition enforcement only under the
+        // user's Library/Keychains directory. A /tmp fixture can silently test
+        // the older ACL format and incorrectly imply update continuity.
+        let keychainDirectory = files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Keychains")
+        let keychainURL = keychainDirectory.appendingPathComponent("StanMicBridge-isolated-test-\(UUID().uuidString).keychain-db")
         let password = UUID().uuidString + UUID().uuidString
         var originalSearchList: CFArray?
         try LocalSigning.check(SecKeychainCopySearchList(&originalSearchList), "Save the test keychain search list")
@@ -93,7 +97,7 @@ enum LocalSigningTests {
         try LocalSigning.require(try Data(contentsOf: oldApp.appendingPathComponent("Contents/MacOS/StanMicBridge")) == originalExecutable,
                                  "A failed update changed the installed fixture.")
         print("Local signing: bad pin, missing configuration and missing identity fail closed; original fixture retained.")
-        print("Local signing integration tests passed. No TCC permission grant or microphone capture was attempted.")
+        print("Local signing diagnostics passed: self-signed update Keychain denial reproduced, not repaired. No TCC permission grant or microphone capture was attempted.")
     }
     static func publicIdentityDiagnostic(config: LocalSigning.Configuration) throws {
         let task = Process()
@@ -137,6 +141,27 @@ enum LocalSigningTests {
         try LocalSigning.require(status != errSecSuccess && exported == nil,
                                  "The non-extractable private key was unexpectedly exported.")
     }
+    static func runProbe(_ executable: URL, mode: String, keychain: String, service: String) throws {
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = [mode, keychain, service]
+        // Probe output contains only generation labels, synthetic partition
+        // identifiers and OSStatus values, never credential values/passwords.
+        process.standardOutput = FileHandle.standardOutput
+        process.standardError = FileHandle.standardError
+        try process.run()
+        let deadline = ProcessInfo.processInfo.systemUptime + 30
+        while process.isRunning && ProcessInfo.processInfo.systemUptime < deadline { Thread.sleep(forTimeInterval: 0.05) }
+        if process.isRunning {
+            process.terminate()
+            let stopDeadline = ProcessInfo.processInfo.systemUptime + 5
+            while process.isRunning && ProcessInfo.processInfo.systemUptime < stopDeadline { Thread.sleep(forTimeInterval: 0.05) }
+            if process.isRunning { _ = kill(process.processIdentifier, SIGKILL) }
+            throw LocalSigning.Failure(message: "Isolated Keychain probe timed out during \(mode).")
+        }
+        try LocalSigning.require(process.terminationStatus == 0,
+            "Isolated Keychain probe \(executable.lastPathComponent) mode \(mode) failed with exit \(process.terminationStatus).")
+    }
     static func keychainContinuity(root: URL, config: LocalSigning.Configuration) throws {
         let source = root.appendingPathComponent("probe.swift")
         let first = root.appendingPathComponent("probe-v1")
@@ -156,6 +181,85 @@ enum LocalSigningTests {
         let service = arguments[3]
         let account = "continuity"
         let value = "local-signing-continuity"
+        let mode = arguments[1]
+        if mode.hasPrefix("modern-") {
+            // Match Credentials' SecItem APIs, but scope every operation to the
+            // disposable keychain; never query or mutate the user's credentials.
+            let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: service, kSecAttrAccount as String: "receiver",
+                kSecMatchSearchList as String: [chain]]
+            let updated = Data("local-signing-updated".utf8)
+            let status: OSStatus
+            switch mode {
+            case "modern-acl":
+                var referenceQuery = query
+                referenceQuery[kSecReturnRef as String] = true
+                referenceQuery[kSecMatchLimit as String] = kSecMatchLimitOne
+                var result: CFTypeRef?
+                let found = SecItemCopyMatching(referenceQuery as CFDictionary, &result)
+                guard found == errSecSuccess, let item = result,
+                      CFGetTypeID(item) == SecKeychainItemGetTypeID() else {
+                    fputs("probe ACL reference OSStatus \(found)\n", stderr); exit(6)
+                }
+                var access: SecAccess?
+                let accessStatus = SecKeychainItemCopyAccess(unsafeBitCast(item, to: SecKeychainItem.self), &access)
+                guard accessStatus == errSecSuccess, let aclAccess = access else {
+                    fputs("probe copy ACL OSStatus \(accessStatus)\n", stderr); exit(6)
+                }
+                let partitions = SecAccessCopyMatchingACLList(aclAccess, kSecACLAuthorizationPartitionID) as? [SecACL] ?? []
+                print("probe isolated item partition ACL count = \(partitions.count)")
+                guard !partitions.isEmpty else {
+                    fputs("Fixture lacks required partition ACL; continuity result would be inconclusive.\n", stderr); exit(6)
+                }
+                for acl in partitions {
+                    var applications: CFArray?
+                    var description: CFString?
+                    var prompt = SecKeychainPromptSelector(rawValue: 0)
+                    let copied = SecACLCopyContents(acl, &applications, &description, &prompt)
+                    guard copied == errSecSuccess else {
+                        fputs("probe partition ACL contents OSStatus \(copied)\n", stderr); exit(6)
+                    }
+                    // Only this disposable item's public partition identifiers;
+                    // never print its stored credential data or a real keychain.
+                    print("probe isolated partition description = \(String(description as String? ?? "<none>").prefix(4096))")
+                }
+                exit(0)
+            case "modern-add":
+                var add = query
+                add.removeValue(forKey: kSecMatchSearchList as String)
+                add[kSecUseKeychain as String] = chain
+                add[kSecValueData as String] = Data(value.utf8)
+                add[kSecAttrLabel as String] = "Stan Mic Bridge isolated credential test"
+                status = SecItemAdd(add as CFDictionary, nil)
+            case "modern-update", "modern-update-denied":
+                status = SecItemUpdate(query as CFDictionary, [kSecValueData as String: updated] as CFDictionary)
+            case "modern-read", "modern-read-updated", "modern-read-denied":
+                var read = query
+                read[kSecReturnData as String] = true
+                read[kSecMatchLimit as String] = kSecMatchLimitOne
+                var result: CFTypeRef?
+                let found = SecItemCopyMatching(read as CFDictionary, &result)
+                if found == errSecSuccess {
+                    let expected = mode == "modern-read-updated" ? updated : Data(value.utf8)
+                    status = (result as? Data) == expected ? errSecSuccess : errSecDecode
+                } else {
+                    status = found
+                }
+            default: exit(2)
+            }
+            if mode.hasSuffix("-denied") {
+                // Missing item, malformed query, and decoding failures are not
+                // evidence that access control rejected the wrong identity.
+                guard status == errSecInteractionNotAllowed || status == errSecAuthFailed else {
+                    fputs("probe expected ACL denial, OSStatus \(status)\n", stderr); exit(5)
+                }
+                print("probe generation \(generation) denied by ACL (\(status))")
+            } else {
+                guard status == errSecSuccess else { fputs("probe modern OSStatus \(status)\n", stderr); exit(4) }
+                print("probe generation \(generation) modern API succeeded")
+            }
+            exit(0)
+        }
         let status: OSStatus = service.withCString { servicePointer in
             account.withCString { accountPointer in
                 if arguments[1] == "write" {
@@ -173,8 +277,15 @@ enum LocalSigningTests {
                 return Data(bytes: pointer, count: Int(length)) == Data(value.utf8) ? errSecSuccess : errSecDecode
             }
         }
-        guard status == errSecSuccess else { fputs("probe OSStatus \(status)\n", stderr); exit(4) }
-        print("probe generation \(generation) succeeded")
+        if mode == "read-denied" {
+            guard status == errSecInteractionNotAllowed || status == errSecAuthFailed else {
+                fputs("probe expected legacy ACL denial, OSStatus \(status)\n", stderr); exit(5)
+            }
+            print("probe generation \(generation) legacy API denied by ACL (\(status))")
+        } else {
+            guard status == errSecSuccess else { fputs("probe OSStatus \(status)\n", stderr); exit(4) }
+            print("probe generation \(generation) succeeded")
+        }
         """#
         for (generation, output) in [("first-distinct-build", first), ("second-distinct-build", second)] {
             try code.replacingOccurrences(of: "__GENERATION__", with: generation).write(to: source, atomically: true, encoding: .utf8)
@@ -186,13 +297,36 @@ enum LocalSigningTests {
         try LocalSigning.checkCode(second, satisfies: oldRequirement)
         try LocalSigning.require(try LocalSigning.requirementData(oldRequirement) == LocalSigning.requirementData(LocalSigning.designatedRequirement(second)),
                                  "Distinct probe builds changed designated requirement.")
-        try LocalSigning.run(first.path, ["write", config.keychainPath, service], captureTestDiagnostics: true)
-        try LocalSigning.run(second.path, ["read", config.keychainPath, service], captureTestDiagnostics: true)
         try FileManager.default.copyItem(at: second, to: wrong)
         try LocalSigning.run("/usr/bin/codesign", ["--force", "--sign", "-", "--identifier", "com.stan.micbridge.signing-probe", wrong.path])
-        try expectFailure("a differently signed Keychain reader") {
-            try LocalSigning.run(wrong.path, ["read", config.keychainPath, service], captureTestDiagnostics: true)
-        }
-        print("Local signing: two distinct signed probe binaries share their own Keychain item; wrong signer denied without prompting.")
+        let modernService = service + ".modern"
+        try runProbe(first, mode: "modern-add", keychain: config.keychainPath, service: modernService)
+        try runProbe(first, mode: "modern-acl", keychain: config.keychainPath, service: modernService)
+        try runProbe(first, mode: "modern-read", keychain: config.keychainPath, service: modernService)
+        try runProbe(second, mode: "modern-read-denied", keychain: config.keychainPath, service: modernService)
+        try runProbe(wrong, mode: "modern-read-denied", keychain: config.keychainPath, service: modernService)
+        try runProbe(wrong, mode: "modern-update-denied", keychain: config.keychainPath, service: modernService)
+        try runProbe(second, mode: "modern-update-denied", keychain: config.keychainPath, service: modernService)
+        try runProbe(first, mode: "modern-update", keychain: config.keychainPath, service: modernService)
+        try runProbe(first, mode: "modern-read-updated", keychain: config.keychainPath, service: modernService)
+        try runProbe(second, mode: "modern-read-denied", keychain: config.keychainPath, service: modernService)
+        print("Local signing diagnostic: partition-enforced SecItem credential denies a distinct self-signed build despite equal designated requirements; original creator retains read/update access.")
+        // The first fixed-signed installation can inherit a receiver item made
+        // by an older ad-hoc build. That item's ACL is separate from the app's
+        // current signing identity. A fresh-item test does not cover migration.
+        let legacyService = service + ".adhoc-origin"
+        try runProbe(wrong, mode: "modern-add", keychain: config.keychainPath, service: legacyService)
+        try runProbe(wrong, mode: "modern-acl", keychain: config.keychainPath, service: legacyService)
+        try runProbe(wrong, mode: "modern-read", keychain: config.keychainPath, service: legacyService)
+        try runProbe(first, mode: "modern-read-denied", keychain: config.keychainPath, service: legacyService)
+        try runProbe(second, mode: "modern-read-denied", keychain: config.keychainPath, service: legacyService)
+        try runProbe(first, mode: "modern-update-denied", keychain: config.keychainPath, service: legacyService)
+        try runProbe(wrong, mode: "modern-read", keychain: config.keychainPath, service: legacyService)
+        print("Local signing: inherited ad-hoc credential denies fixed identity without interaction; original item remains readable by its creator. Always Allow migration is not simulated.")
+        try runProbe(first, mode: "write", keychain: config.keychainPath, service: service)
+        try runProbe(first, mode: "read", keychain: config.keychainPath, service: service)
+        try runProbe(second, mode: "read-denied", keychain: config.keychainPath, service: service)
+        try runProbe(wrong, mode: "read-denied", keychain: config.keychainPath, service: service)
+        print("Local signing diagnostic: legacy SecKeychain API also denies the next distinct self-signed build under partition enforcement.")
     }
 }
