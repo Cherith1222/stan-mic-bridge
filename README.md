@@ -20,7 +20,7 @@ Windows receiver → VB-CABLE → Windows default microphone → your app
 - Convert microphone audio to 48 kHz mono Float32 with bounded buffering.
 - Switch Windows default microphone roles on first audio, then restore them when the session ends.
 - Browser sender included as an alternative; its tab must remain open.
-- No audio files or transcripts recorded by the bridge. Your dictation application's own data policy still applies.
+- Normal streaming does not record audio files or transcripts. The optional local diagnostic recorder described below saves audio only when explicitly run. Your dictation application's own data policy still applies.
 
 ## Requirements
 
@@ -145,6 +145,17 @@ References: [Apple TN2206: Code signing in depth](https://developer.apple.com/li
 
 **音訊狀態…** (Audio status) displays local session counters to compare captured, converted, sent, and discarded audio frames. It does not record audio, persist speech, or include connection credentials. These counters help identify missing audio; they are not a speech-recognition accuracy score. The transport uses uncompressed 48 kHz mono float32 PCM. Different microphones, source processing, network jitter, and queue starvation can affect the result heard by a Windows dictation app.
 
+For an explicitly requested listening test on Windows, `capture_audio.py` records the WASAPI **CABLE Output** input in shared mode, without restarting the receiver or changing default microphones:
+
+```powershell
+New-Item -ItemType Directory -Force recordings | Out-Null
+.\.venv\Scripts\python.exe capture_audio.py --seconds 20 --output recordings\cable-test.wav
+```
+
+This opt-in tool saves a local WAV and a metadata-only JSON sidecar, refuses to overwrite existing files, and limits each capture to 60 seconds. The `recordings/` directory is ignored by Git. Speak only material you want saved; delete the local test files after listening when no longer needed. The recorder does not upload audio or run transcription.
+
+The recording captures the virtual microphone signal available to a dictation app, including the receiver and VB-CABLE path. It does not capture the Mac microphone before transmission or reveal the dictation app's internal processing. Exact-zero runs, clipping, and capture overflows are diagnostic observations; silence alone does not prove network loss. Compare the playback, Mac Audio Status counters, and the dictation result before assigning a cause.
+
 ## Browser alternative
 
 Open the same private pairing link in a microphone-capable browser, press Start, and keep that tab open. The browser stores its token only in page memory, so a reload may require the link again. The native app uses Keychain and does not need Chrome.
@@ -162,6 +173,8 @@ Open the same private pairing link in a microphone-capable browser, press Start,
 ## Verification
 
 The original deployment passed synthetic Windows virtual-audio round trips and microphone-role restoration checks. The author also reported successful native Mac installation/use. Hardware combinations, Mac login startup, and native sleep/wake behavior are not comprehensively tested.
+
+On 2026-10-13, the author reported that the in-app upgrade from locally installed 1.3.7 to 1.3.8 did not request permission or a Keychain password, and the app remained open after updating. This is target-Mac user confirmation, separate from CI; it does not establish permission retention on every Mac or resolve the ongoing audio-quality investigation.
 
 Lightweight checks (Node.js is needed only for the browser simulation):
 

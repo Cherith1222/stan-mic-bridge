@@ -9,5 +9,6 @@ active-mic-route.*
 *.zip
 .DS_Store
 mac-release/
+recordings/
 CHECKPOINT.md
 *.bak*
