@@ -2,6 +2,8 @@
 *.command text eol=lf
 *.sh text eol=lf
 *.swift text eol=lf
+*.entitlements text eol=lf
+*.plist text eol=lf
 *.py text eol=lf
 *.js text eol=lf
 *.cjs text eol=lf

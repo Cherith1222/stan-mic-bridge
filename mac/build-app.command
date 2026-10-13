@@ -43,8 +43,12 @@ xcrun swiftc -swift-version 5 -O -framework AppKit GenerateIcon.swift -o "$stage
 "$stage/GenerateIcon" "$stage/AppIcon.iconset"
 iconutil --convert icns "$stage/AppIcon.iconset" --output "$app/Contents/Resources/AppIcon.icns"
 [[ -s "$app/Contents/Resources/AppIcon.icns" ]]
+# Normalize a separate signing input even when a source archive was converted
+# by another platform. AMFI requires standard XML with LF line endings.
+plutil -convert xml1 -o "$stage/AudioInput.entitlements" AudioInput.entitlements
+plutil -lint "$stage/AudioInput.entitlements"
 codesign --force --sign - --options runtime --identifier com.stan.micbridge.updater "$app/Contents/Helpers/StanMicUpdater"
 codesign --force --sign - --options runtime --identifier com.stan.micbridge.credentials "$app/Contents/Helpers/StanMicCredentialBroker"
-codesign --force --sign - --options runtime --entitlements AudioInput.entitlements --identifier com.stan.micbridge "$app"
+codesign --force --sign - --options runtime --entitlements "$stage/AudioInput.entitlements" --identifier com.stan.micbridge "$app"
 codesign --verify --deep --strict --verbose=2 "$app"
 echo "Built: $app"

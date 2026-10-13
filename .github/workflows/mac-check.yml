@@ -3,7 +3,7 @@ name: Mac build and update checks
 on:
   push:
     branches: [main]
-    paths: ['mac/**', '.github/workflows/mac-check.yml']
+    paths: ['mac/**', '.gitattributes', '.github/workflows/mac-check.yml']
   workflow_dispatch:
 
 permissions:
@@ -15,14 +15,41 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Package and verify release source under Windows conversion settings
+        run: |
+          mkdir -p "$RUNNER_TEMP/package" "$RUNNER_TEMP/release-source"
+          git -c core.autocrlf=true archive --format=zip --prefix=StanMicBridge/ --output="$RUNNER_TEMP/package/StanMicBridge-source.zip" HEAD mac README.md LICENSE
+          unzip -q "$RUNNER_TEMP/package/StanMicBridge-source.zip" -d "$RUNNER_TEMP/release-source"
+          python3 - <<'PY'
+          import os, pathlib
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'release-source/StanMicBridge/mac'
+          for path in root.iterdir():
+              if path.suffix in ('.entitlements', '.plist', '.command', '.swift'):
+                  data = path.read_bytes()
+                  assert b'\r' not in data and not data.startswith(b'\xef\xbb\xbf'), path.name
+          print('Release source signing inputs: LF, no BOM.')
+          PY
+          cd "$RUNNER_TEMP/package"
+          shasum -a 256 StanMicBridge-source.zip > SHA256-source.txt
       - name: Validate installer and metadata
         run: |
+          cd "$RUNNER_TEMP/release-source/StanMicBridge"
           bash -n mac/install.command
           bash -n mac/build-app.command
           bash mac/test-install-recovery.command
           plutil -lint mac/Info.plist
+          python3 - <<'PY'
+          import os, pathlib
+          source = pathlib.Path('mac/AudioInput.entitlements').read_bytes()
+          (pathlib.Path(os.environ['RUNNER_TEMP']) / 'crlf.entitlements').write_bytes(source.replace(b'\n', b'\r\n'))
+          PY
+          plutil -convert xml1 -o "$RUNNER_TEMP/normalized.entitlements" "$RUNNER_TEMP/crlf.entitlements"
+          cp /usr/bin/true "$RUNNER_TEMP/entitlements-probe"
+          codesign --force --sign - --options runtime --entitlements "$RUNNER_TEMP/normalized.entitlements" "$RUNNER_TEMP/entitlements-probe"
+          codesign --verify --strict "$RUNNER_TEMP/entitlements-probe"
       - name: Build universal app with signed update helper
         run: |
+          cd "$RUNNER_TEMP/release-source/StanMicBridge"
           bash mac/build-app.command "$RUNNER_TEMP/package" --universal
           lipo "$RUNNER_TEMP/package/Stan Mic Bridge.app/Contents/MacOS/StanMicBridge" -verify_arch x86_64 arm64
           lipo "$RUNNER_TEMP/package/Stan Mic Bridge.app/Contents/Helpers/StanMicUpdater" -verify_arch x86_64 arm64
@@ -37,7 +64,7 @@ jobs:
           "$RUNNER_TEMP/package/Stan Mic Bridge.app/Contents/Helpers/StanMicUpdater" --test-bootstrap-paths "$RUNNER_TEMP/package/Stan Mic Bridge.app"
           "$RUNNER_TEMP/package/Stan Mic Bridge.app/Contents/Helpers/StanMicUpdater" --test-startup "$RUNNER_TEMP/package/Stan Mic Bridge.app"
           "$RUNNER_TEMP/package/Stan Mic Bridge.app/Contents/Helpers/StanMicUpdater" --test-startup-resume "$RUNNER_TEMP/package/Stan Mic Bridge.app"
-          "$RUNNER_TEMP/package/Stan Mic Bridge.app/Contents/Helpers/StanMicUpdater" --test-credential-broker "$RUNNER_TEMP/package/Stan Mic Bridge.app" "$GITHUB_WORKSPACE/mac"
+          "$RUNNER_TEMP/package/Stan Mic Bridge.app/Contents/Helpers/StanMicUpdater" --test-credential-broker "$RUNNER_TEMP/package/Stan Mic Bridge.app" "$RUNNER_TEMP/release-source/StanMicBridge/mac"
       - name: Package app
         run: |
           cd "$RUNNER_TEMP/package"
@@ -52,3 +79,5 @@ jobs:
           path: |
             ${{ runner.temp }}/package/StanMicBridge-macOS.zip
             ${{ runner.temp }}/package/SHA256-binary.txt
+            ${{ runner.temp }}/package/StanMicBridge-source.zip
+            ${{ runner.temp }}/package/SHA256-source.txt
