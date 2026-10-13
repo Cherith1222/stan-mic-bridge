@@ -571,6 +571,8 @@ do {
     }
     else if arguments.count == 2 && arguments[0] == "--test-local-signing" {
         try LocalSigningTests.run(app: URL(fileURLWithPath: arguments[1]))
+    } else if arguments.count == 3 && arguments[0] == "--test-credential-broker" {
+        try LocalSigningTests.run(app: URL(fileURLWithPath: arguments[1]), brokerSources: URL(fileURLWithPath: arguments[2]))
     }
     else if arguments.count == 2 && arguments[0] == "--setup-local-signing" {
         try LocalSigning.setup(app: signingSetupStage(arguments[1]))

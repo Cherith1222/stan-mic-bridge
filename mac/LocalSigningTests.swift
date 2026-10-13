@@ -6,7 +6,7 @@ import Darwin
 // Executed only by --test-local-signing. No production keychain, trust settings,
 // app installation, microphone entitlement, or receiver credential is changed.
 enum LocalSigningTests {
-    static func run(app source: URL) throws {
+    static func run(app source: URL, brokerSources: URL? = nil) throws {
         let files = FileManager.default
         let root = files.temporaryDirectory.appendingPathComponent("StanMicBridge-signing-test-\(UUID().uuidString)")
         try files.createDirectory(at: root, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
@@ -76,6 +76,9 @@ enum LocalSigningTests {
                                  "Preparing the new app changed the installed fixture.")
         print("Local signing: two app builds preserve exact app and helper designated requirements.")
         try keychainContinuity(root: root, config: config)
+        if let sources = brokerSources {
+            try CredentialBrokerTests.run(root: root, config: config, sources: sources, password: password)
+        }
         // A bad pin, missing configuration, and deleted identity all fail closed.
         let bad = LocalSigning.Configuration(schema: 1, certificateSHA1: String(repeating: "0", count: 40),
             keychainPath: config.keychainPath, label: config.label, createdAt: config.createdAt)

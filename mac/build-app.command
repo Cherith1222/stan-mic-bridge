@@ -18,26 +18,33 @@ cp Info.plist "$app/Contents/Info.plist"
 plutil -lint "$app/Contents/Info.plist"
 main_binaries=()
 helper_binaries=()
+broker_binaries=()
 for arch in "${archs[@]}"; do
   case "$arch" in x86_64|arm64) ;; *) echo 'Unsupported architecture.' >&2; exit 1 ;; esac
   echo "Building $arch app and update helper…"
   xcrun swiftc -swift-version 5 -O -target "${arch}-apple-macosx12.0" \
     -framework AppKit -framework AVFoundation -framework Security -framework CryptoKit \
-    StanMicBridge.swift LocalSigning.swift -o "$stage/StanMicBridge-$arch"
+    StanMicBridge.swift LocalSigning.swift CredentialBrokerClient.swift CredentialBrokerProtocol.swift -o "$stage/StanMicBridge-$arch"
   xcrun swiftc -swift-version 5 -O -target "${arch}-apple-macosx12.0" \
     -framework AppKit -framework Security -framework CryptoKit \
-    UpdateHelper.swift LocalSigning.swift LocalSigningTests.swift -o "$stage/StanMicUpdater-$arch"
+    UpdateHelper.swift LocalSigning.swift LocalSigningTests.swift CredentialBrokerTests.swift -o "$stage/StanMicUpdater-$arch"
+  xcrun swiftc -swift-version 5 -O -target "${arch}-apple-macosx12.0" \
+    -framework Security -framework CryptoKit \
+    CredentialBroker.swift CredentialBrokerProtocol.swift -o "$stage/StanMicCredentialBroker-$arch"
   main_binaries+=("$stage/StanMicBridge-$arch")
   helper_binaries+=("$stage/StanMicUpdater-$arch")
+  broker_binaries+=("$stage/StanMicCredentialBroker-$arch")
 done
 xcrun lipo -create "${main_binaries[@]}" -output "$app/Contents/MacOS/StanMicBridge"
 xcrun lipo -create "${helper_binaries[@]}" -output "$app/Contents/Helpers/StanMicUpdater"
+xcrun lipo -create "${broker_binaries[@]}" -output "$app/Contents/Helpers/StanMicCredentialBroker"
 echo 'Generating the application icon…'
 xcrun swiftc -swift-version 5 -O -framework AppKit GenerateIcon.swift -o "$stage/GenerateIcon"
 "$stage/GenerateIcon" "$stage/AppIcon.iconset"
 iconutil --convert icns "$stage/AppIcon.iconset" --output "$app/Contents/Resources/AppIcon.icns"
 [[ -s "$app/Contents/Resources/AppIcon.icns" ]]
-codesign --force --sign - --identifier com.stan.micbridge.updater "$app/Contents/Helpers/StanMicUpdater"
-codesign --force --sign - --identifier com.stan.micbridge "$app"
+codesign --force --sign - --options runtime --identifier com.stan.micbridge.updater "$app/Contents/Helpers/StanMicUpdater"
+codesign --force --sign - --options runtime --identifier com.stan.micbridge.credentials "$app/Contents/Helpers/StanMicCredentialBroker"
+codesign --force --sign - --options runtime --entitlements AudioInput.entitlements --identifier com.stan.micbridge "$app"
 codesign --verify --deep --strict --verbose=2 "$app"
 echo "Built: $app"

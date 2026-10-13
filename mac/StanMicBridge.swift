@@ -42,8 +42,9 @@ private struct Connection: Codable {
 }
 
 private enum Credentials {
-    // Native login Keychain: suitable for a locally built, ad-hoc signed app.
-    // The secret is never stored in UserDefaults or a launch command.
+    // Fixed-signing installations use a stable child identity. Ad-hoc users
+    // retain the original Keychain path and its per-update approval behavior.
+    static private(set) var lastError: String?
     static var query: [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
          kSecAttrService as String: "com.stan.micbridge",
@@ -51,6 +52,13 @@ private enum Credentials {
     }
 
     static func load() -> Connection? {
+        lastError = nil
+        do {
+            if try LocalSigning.isEnabled(for: Bundle.main.bundleURL) {
+                guard let data = try CredentialBrokerClient.perform("load") else { return nil }
+                return try JSONDecoder().decode(Connection.self, from: data)
+            }
+        } catch { lastError = error.localizedDescription; return nil }
         var search = query
         search[kSecReturnData as String] = true
         search[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -61,7 +69,14 @@ private enum Credentials {
     }
 
     static func save(_ connection: Connection) -> Bool {
+        lastError = nil
         guard let data = try? JSONEncoder().encode(connection) else { return false }
+        do {
+            if try LocalSigning.isEnabled(for: Bundle.main.bundleURL) {
+                _ = try CredentialBrokerClient.perform("save", payload: data)
+                return true
+            }
+        } catch { lastError = error.localizedDescription; return false }
         let attributes = [kSecValueData as String: data]
         let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
         if status == errSecSuccess { return true }
@@ -73,6 +88,13 @@ private enum Credentials {
     }
 
     static func remove() -> Bool {
+        lastError = nil
+        do {
+            if try LocalSigning.isEnabled(for: Bundle.main.bundleURL) {
+                _ = try CredentialBrokerClient.perform("remove")
+                return true
+            }
+        } catch { lastError = error.localizedDescription; return false }
         let status = SecItemDelete(query as CFDictionary)
         return status == errSecSuccess || status == errSecItemNotFound
     }
@@ -657,6 +679,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // without requiring a CI login Keychain or blocking on onboarding.
         connection = UpdateStaging.isStartupTest ? nil : Credentials.load()
         show(connection == nil ? "請先設定連線" : "已停止")
+        if let failure = Credentials.lastError, !UpdateStaging.isStartupTest {
+            show("鑰匙圈尚未就緒；連線已停止")
+            DispatchQueue.main.async { [weak self] in self?.message("無法讀取已儲存連線", failure) }
+        }
         if resumeGranted {
             let permission = AVCaptureDevice.authorizationStatus(for: .audio)
             if generation == startupGeneration && UpdateResume.authorized(grant: true,
@@ -1045,7 +1071,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         guard Credentials.save(candidate) else {
-            message("無法儲存鑰匙圈", "請確認登入鑰匙圈已解鎖，再重新設定。")
+            message("無法儲存鑰匙圈", Credentials.lastError ?? "請確認登入鑰匙圈已解鎖，再重新設定。")
             return
         }
         connection = candidate
@@ -1057,12 +1083,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "清除這台 Mac 儲存的連線？"
-        alert.informativeText = "只會刪除此程式的鑰匙圈項目，Windows 接收端不會改變。"
+        alert.informativeText = "只會清除此程式儲存的連線資料，Windows 接收端不會改變。"
         alert.addButton(withTitle: "清除")
         alert.addButton(withTitle: "取消")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         guard Credentials.remove() else {
-            message("無法清除鑰匙圈", "請確認登入鑰匙圈已解鎖後重試。")
+            connection = nil
+            show("連線已停止；請完成清除或重新設定")
+            message("無法完成清除鑰匙圈", Credentials.lastError ?? "請確認登入鑰匙圈已解鎖後重試。")
             return
         }
         connection = nil

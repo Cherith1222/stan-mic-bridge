@@ -191,9 +191,20 @@ enum LocalSigning {
         throw Failure(message: "The pinned signing identity is missing. No ad-hoc fallback is permitted.")
     }
     static func sign(_ path: URL, identifier: String, config: Configuration) throws {
-        try run("/usr/bin/codesign", ["--force", "--sign", config.certificateSHA1,
+        var arguments = ["--force", "--sign", config.certificateSHA1,
             "--keychain", config.keychainPath, "--identifier", identifier, "--timestamp=none",
-            "--requirements", "=designated => " + requirement(identifier: identifier, fingerprint: config.certificateSHA1), path.path], timeout: 120)
+            "--options", "runtime", "--requirements", "=designated => " + requirement(identifier: identifier, fingerprint: config.certificateSHA1)]
+        let temporary = fileManager.temporaryDirectory.appendingPathComponent("StanMicBridge-entitlements-" + UUID().uuidString)
+        if identifier == appIdentifier {
+            try fileManager.createDirectory(at: temporary, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+            let entitlements = temporary.appendingPathComponent("audio.plist")
+            let data = try PropertyListSerialization.data(fromPropertyList: ["com.apple.security.device.audio-input": true], format: .xml, options: 0)
+            try data.write(to: entitlements, options: .withoutOverwriting)
+            arguments += ["--entitlements", entitlements.path]
+        }
+        defer { if identifier == appIdentifier { try? fileManager.removeItem(at: temporary) } }
+        arguments.append(path.path)
+        try run("/usr/bin/codesign", arguments, timeout: 120)
         try verifyPinned(path, config: config, identifier: identifier)
     }
     static func signApp(_ app: URL, config: Configuration) throws {
