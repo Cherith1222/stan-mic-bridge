@@ -231,7 +231,7 @@ enum LocalSigningTests {
                 add[kSecValueData as String] = Data(value.utf8)
                 add[kSecAttrLabel as String] = "Stan Mic Bridge isolated credential test"
                 status = SecItemAdd(add as CFDictionary, nil)
-            case "modern-update", "modern-update-denied":
+            case "modern-update":
                 status = SecItemUpdate(query as CFDictionary, [kSecValueData as String: updated] as CFDictionary)
             case "modern-read", "modern-read-updated", "modern-read-denied":
                 var read = query
@@ -305,12 +305,13 @@ enum LocalSigningTests {
         try runProbe(first, mode: "modern-read", keychain: config.keychainPath, service: modernService)
         try runProbe(second, mode: "modern-read-denied", keychain: config.keychainPath, service: modernService)
         try runProbe(wrong, mode: "modern-read-denied", keychain: config.keychainPath, service: modernService)
-        try runProbe(wrong, mode: "modern-update-denied", keychain: config.keychainPath, service: modernService)
-        try runProbe(second, mode: "modern-update-denied", keychain: config.keychainPath, service: modernService)
+        // CI demonstrated that SecItemUpdate can succeed for a caller denied
+        // secret reads. This diagnostic asserts read privacy, not write denial;
+        // only the creator updates its synthetic item here.
         try runProbe(first, mode: "modern-update", keychain: config.keychainPath, service: modernService)
         try runProbe(first, mode: "modern-read-updated", keychain: config.keychainPath, service: modernService)
         try runProbe(second, mode: "modern-read-denied", keychain: config.keychainPath, service: modernService)
-        print("Local signing diagnostic: partition-enforced SecItem credential denies a distinct self-signed build despite equal designated requirements; original creator retains read/update access.")
+        print("Local signing diagnostic: partition-enforced SecItem credential denies secret reads by a distinct self-signed build despite equal designated requirements; original creator retains read/update access. Write protection is not asserted.")
         // The first fixed-signed installation can inherit a receiver item made
         // by an older ad-hoc build. That item's ACL is separate from the app's
         // current signing identity. A fresh-item test does not cover migration.
@@ -320,7 +321,6 @@ enum LocalSigningTests {
         try runProbe(wrong, mode: "modern-read", keychain: config.keychainPath, service: legacyService)
         try runProbe(first, mode: "modern-read-denied", keychain: config.keychainPath, service: legacyService)
         try runProbe(second, mode: "modern-read-denied", keychain: config.keychainPath, service: legacyService)
-        try runProbe(first, mode: "modern-update-denied", keychain: config.keychainPath, service: legacyService)
         try runProbe(wrong, mode: "modern-read", keychain: config.keychainPath, service: legacyService)
         print("Local signing: inherited ad-hoc credential denies fixed identity without interaction; original item remains readable by its creator. Always Allow migration is not simulated.")
         try runProbe(first, mode: "write", keychain: config.keychainPath, service: service)
