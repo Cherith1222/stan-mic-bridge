@@ -147,6 +147,12 @@ enum CredentialBrokerTests {
         try check(client, "removed")
         try activate(second)
         try check(client, "removed")
+        // Removal blocks implicit legacy resurrection, but an explicit new save
+        // must be able to replace the tombstone and survive another app build.
+        try check(client, "save-updated")
+        try check(client, "load-updated")
+        try activate(first)
+        try check(client, "load-updated")
         try LocalSigning.require(SHA256.hash(data: try Data(contentsOf: installed)) == digest,
                                  "Credential tests changed the immutable broker.")
         print("Credential broker: two distinct app builds used the same frozen executable; scoped Keychain reads, caller denial, malformed input, migration, tombstone and helper integrity checks passed.")

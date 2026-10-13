@@ -11,6 +11,9 @@ struct CredentialBroker {
     static let service = "com.stan.micbridge.credentials.v2"
     static let legacyService = "com.stan.micbridge"
     static let account = "receiver"
+    // Nonempty, versioned bytes avoid depending on zero-length Keychain
+    // return semantics. Only remove() writes this exact marker.
+    static let removalMarker = Data("StanMicBridge:credential-removed:v1".utf8)
 
     struct Caller {
         let pid: pid_t
@@ -161,8 +164,9 @@ struct CredentialBroker {
             let current = try read(CredentialBroker.service)
             if current.0 == errSecSuccess {
                 guard let data = current.1 else { return (errSecDecode, nil) }
-                // Tombstone means removed; never revive the retained legacy copy.
-                if data.isEmpty { return (errSecItemNotFound, nil) }
+                // Only the verified marker means removed. Nil, empty or
+                // malformed data remain decode errors and never revive legacy.
+                if data == CredentialBroker.removalMarker { return (errSecItemNotFound, nil) }
                 return CredentialBrokerWire.ConnectionData.decode(data) != nil ? current : (errSecDecode, nil)
             }
             guard current.0 == errSecItemNotFound else { return current }
@@ -182,7 +186,7 @@ struct CredentialBroker {
             return verification
         }
         func remove() throws -> OSStatus {
-            let tombstone = try write(Data())
+            let tombstone = try write(CredentialBroker.removalMarker)
             guard tombstone == errSecSuccess else { return tombstone }
             try caller.validate()
             let deleted = SecItemDelete(query(CredentialBroker.legacyService) as CFDictionary)

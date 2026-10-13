@@ -25,9 +25,38 @@ if pgrep -x StanMicBridge >/dev/null; then
 fi
 temporary_root="${TMPDIR:-/tmp}"
 stage="$(mktemp -d "${temporary_root%/}/stan-mic-build.XXXXXX")"
-trap 'rm -rf -- "$stage"' EXIT
 app="$stage/Stan Mic Bridge.app"
-destination="$HOME/Applications/Stan Mic Bridge.app"
+applications_dir="$HOME/Applications"
+destination="$applications_dir/Stan Mic Bridge.app"
+backup=''
+cleanup_install() {
+  result=$?
+  trap - EXIT
+  if (( result != 0 )); then
+    if [[ -n "$backup" && -d "$backup" && ! -e "$destination" && ! -L "$destination" ]]; then
+      mv "$backup" "$destination" || echo "Previous app remains at: $backup" >&2
+    fi
+    if [[ -e "$app/Contents/Resources/CredentialBrokerPin.json" || -L "$app/Contents/Resources/CredentialBrokerPin.json" ]]; then
+      recovery="$applications_dir/Stan Mic Bridge.install-recovery.app"
+      if [[ -d "$applications_dir" && ! -L "$applications_dir" && ! -e "$recovery" && ! -L "$recovery" ]] && mv "$app" "$recovery"; then
+        if codesign --verify --deep --strict "$recovery"; then
+          echo "Installation was interrupted. Signature-verified pin recovery retained at: $recovery" >&2
+          echo 'To recover, quit Stan Mic Bridge. Preserve any app currently in ~/Applications under a backup name, then move this retained app to ~/Applications/Stan Mic Bridge.app using Finder.' >&2
+          echo 'Then rerun this trusted source installer with --local-signing. Recovery bundles are never adopted automatically.' >&2
+        else
+          echo "Installation was interrupted. Staged files retained for repair at: $recovery" >&2
+          echo 'Signature verification failed. Do not install these retained files; preserve them for repair.' >&2
+        fi
+      else
+        echo "Installation was interrupted. Keep the staging folder for credential-pin recovery: $stage" >&2
+        exit "$result"
+      fi
+    fi
+  fi
+  rm -rf -- "$stage"
+  exit "$result"
+}
+trap cleanup_install EXIT
 if [[ -L "$HOME/Applications" || -L "$destination" ]]; then
   echo 'Installation directory or app must not be a symbolic link.' >&2
   exit 1

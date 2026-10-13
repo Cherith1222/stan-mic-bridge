@@ -19,6 +19,7 @@ jobs:
         run: |
           bash -n mac/install.command
           bash -n mac/build-app.command
+          bash mac/test-install-recovery.command
           plutil -lint mac/Info.plist
       - name: Build universal app with signed update helper
         run: |
