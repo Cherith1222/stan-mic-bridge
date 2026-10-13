@@ -200,7 +200,7 @@ struct CredentialBroker {
             if ready < 0 { if errno == EINTR { continue }; throw Failure.invalid }
             if ready == 0 { continue }
             var buffer = [UInt8](repeating: 0, count: 4096)
-            let count = Darwin.read(STDIN_FILENO, &buffer, buffer.count)
+            let count = Darwin.read(STDIN_FILENO, &buffer, 4096)
             if count < 0 { if errno == EINTR { continue }; throw Failure.invalid }
             if count == 0 { return input }
             guard input.count + count <= CredentialBrokerWire.maximumMessageBytes else { throw Failure.invalid }

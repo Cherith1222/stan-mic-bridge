@@ -39,12 +39,14 @@ signer="$stage/StanMicSigningHelper"
 cp "$app/Contents/Helpers/StanMicUpdater" "$signer"
 codesign --verify --strict "$signer"
 if [[ "${1:-}" == --local-signing ]]; then
-  echo "Setting up or reusing this Mac's fixed signing identity. macOS may ask for Keychain approval."
+  echo 'This source-installer run establishes the sealed credential-broker pin; older in-app updaters cannot perform this first migration.'
+  echo "Setting up or reusing this Mac's fixed signing identity and sealed credential-broker pin. macOS may ask for Keychain approval."
   "$signer" --setup-local-signing "$app"
 else
   # Preserve an existing local identity even when the flag is omitted on a later install.
   "$signer" --prepare-local-signing "$app" "$destination"
 fi
+codesign --verify --deep --strict "$app"
 if [[ -e "$destination" ]]; then
   backup="$HOME/Applications/Stan Mic Bridge.backup.$(date +%Y%m%d-%H%M%S).app"
   [[ ! -e "$backup" ]] || { echo 'Backup already exists; try again later.' >&2; exit 1; }

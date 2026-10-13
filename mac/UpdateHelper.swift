@@ -576,7 +576,7 @@ do {
     }
     else if arguments.count == 2 && arguments[0] == "--setup-local-signing" {
         try LocalSigning.setup(app: signingSetupStage(arguments[1]))
-        print("The staging app now uses the pinned local signing identity.")
+        print("The staging app now uses the pinned local signing identity and sealed credential-broker pin.")
     }
     else if arguments.count == 3 && arguments[0] == "--prepare-local-signing" {
         let stage = try signingSetupStage(arguments[1])

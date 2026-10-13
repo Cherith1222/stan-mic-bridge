@@ -27,7 +27,7 @@ for arch in "${archs[@]}"; do
     StanMicBridge.swift LocalSigning.swift CredentialBrokerClient.swift CredentialBrokerProtocol.swift -o "$stage/StanMicBridge-$arch"
   xcrun swiftc -swift-version 5 -O -target "${arch}-apple-macosx12.0" \
     -framework AppKit -framework Security -framework CryptoKit \
-    UpdateHelper.swift LocalSigning.swift LocalSigningTests.swift CredentialBrokerTests.swift -o "$stage/StanMicUpdater-$arch"
+    UpdateHelper.swift LocalSigning.swift LocalSigningTests.swift CredentialBrokerTests.swift CredentialBrokerClient.swift CredentialBrokerProtocol.swift -o "$stage/StanMicUpdater-$arch"
   xcrun swiftc -swift-version 5 -O -target "${arch}-apple-macosx12.0" \
     -framework Security -framework CryptoKit \
     CredentialBroker.swift CredentialBrokerProtocol.swift -o "$stage/StanMicCredentialBroker-$arch"

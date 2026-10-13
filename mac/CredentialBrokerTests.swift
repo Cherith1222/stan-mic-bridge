@@ -15,6 +15,7 @@ enum CredentialBrokerTests {
         let bundled = fixture.appendingPathComponent("bundled-broker")
         let installed = fixture.appendingPathComponent("credentials/v1/StanMicCredentialBroker")
         let client = fixture.appendingPathComponent("client")
+        let bootstrap = fixture.appendingPathComponent("client-bootstrap")
         let first = fixture.appendingPathComponent("client-one")
         let second = fixture.appendingPathComponent("client-two")
         let wrong = fixture.appendingPathComponent("client-wrong")
@@ -22,16 +23,20 @@ enum CredentialBrokerTests {
         let common = ["swiftc", "-swift-version", "5", "-O", "-D", "BROKER_TESTING", "-framework", "Security"]
         try LocalSigning.run("/usr/bin/xcrun", common + [sources.appendingPathComponent("CredentialBroker.swift").path,
             sources.appendingPathComponent("CredentialBrokerProtocol.swift").path, "-o", bundled.path], timeout: 120, captureTestDiagnostics: true)
-        // prepare() signs and pins the initially bundled broker exactly once.
+        // Explicit fixture bootstrap signs the initially bundled broker once.
         try LocalSigning.run("/usr/bin/codesign", ["--force", "--sign", "-", bundled.path])
-        for (generation, destination) in [("first-build", first), ("second-build", second)] {
-            try probe.replacingOccurrences(of: "__GENERATION__", with: generation).write(to: swift, atomically: true, encoding: .utf8)
+        func compileClient(_ generation: String, destination: URL, pin: String, codeHashes: [String] = []) throws {
+            try LocalSigning.require(codeHashes.allSatisfy { !$0.isEmpty && $0.allSatisfy { "0123456789abcdef".contains($0) } },
+                                     "Fixture code hashes are not hexadecimal literals.")
+            let hashLiteral = "[" + codeHashes.map { "\"" + $0 + "\"" }.joined(separator: ",") + "]"
+            try probe.replacingOccurrences(of: "__GENERATION__", with: generation)
+                .replacingOccurrences(of: "__PIN__", with: pin)
+                .replacingOccurrences(of: "__CODE_HASHES__", with: hashLiteral).write(to: swift, atomically: true, encoding: .utf8)
             try LocalSigning.run("/usr/bin/xcrun", common + [sources.appendingPathComponent("CredentialBrokerClient.swift").path,
                 sources.appendingPathComponent("CredentialBrokerProtocol.swift").path,
                 sources.appendingPathComponent("LocalSigning.swift").path, swift.path, "-o", destination.path], timeout: 120, captureTestDiagnostics: true)
             try LocalSigning.sign(destination, identifier: "com.stan.micbridge", config: config)
         }
-        try LocalSigning.require(try Data(contentsOf: first) != Data(contentsOf: second), "Broker probes must be distinct builds.")
         func activate(_ executable: URL) throws {
             if files.fileExists(atPath: client.path) { try files.removeItem(at: client) }
             try files.copyItem(at: executable, to: client)
@@ -41,10 +46,33 @@ enum CredentialBrokerTests {
             try LocalSigning.run(executable.path, [mode, fixture.path, config.keychainPath, client.path], timeout: 40, captureTestDiagnostics: true)
             print("Credential broker isolated test: \(mode) passed.")
         }
-        try activate(first)
+        try compileClient("bootstrap-only", destination: bootstrap, pin: "")
+        try activate(bootstrap)
+        try check(client, "helper-rejected") // Missing sealed pin cannot bootstrap during normal load.
+        try LocalSigning.require(!files.fileExists(atPath: installed.path), "Normal load bootstrapped a broker without a sealed pin.")
         try check(client, "prepare")
         let original = try Data(contentsOf: installed)
         let digest = SHA256.hash(data: original)
+        let pin = digest.map { String(format: "%02x", $0) }.joined()
+        let trustedCodeHashes = try CredentialBrokerClient.codeHashes(installed)
+        for (generation, destination) in [("first-build", first), ("second-build", second)] {
+            try compileClient(generation, destination: destination, pin: pin, codeHashes: trustedCodeHashes)
+        }
+        try LocalSigning.require(try Data(contentsOf: first) != Data(contentsOf: second), "Broker probes must be distinct builds.")
+        try activate(first)
+        // Exercise migration before any v2 item exists. The test coordinator is
+        // deliberately not an owner of the broker-created item and must not
+        // reset/delete it to arrange a later fixture.
+        try seedLegacy(installed: installed, config: config, password: password)
+        try check(client, "load")
+        let chain = try LocalSigning.openKeychain(config.keychainPath)
+        let legacyReferenceQuery: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "com.stan.micbridge", kSecAttrAccount as String: "receiver",
+            kSecMatchSearchList as String: [chain], kSecReturnRef as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne]
+        var retainedLegacy: CFTypeRef?
+        try LocalSigning.check(SecItemCopyMatching(legacyReferenceQuery as CFDictionary, &retainedLegacy),
+                               "Verify migration retained the isolated legacy item")
         try check(client, "save")
         try assertPartition(config: config)
         try check(client, "load")
@@ -58,7 +86,7 @@ enum CredentialBrokerTests {
         // Same leaf and identifier, but an executable outside the allowed path.
         try check(second, "raw-wrong-path")
         try files.copyItem(at: first, to: wrong)
-        try LocalSigning.run("/usr/bin/codesign", ["--force", "--sign", "-", "--identifier", "com.stan.micbridge", wrong.path])
+        try LocalSigning.run("/usr/bin/codesign", ["--force", "--sign", "-", "--options", "runtime", "--identifier", "com.stan.micbridge", wrong.path])
         try activate(wrong)
         try check(client, "raw-wrong-signer")
         try LocalSigning.sign(wrong, identifier: "com.stan.micbridge.other", config: config)
@@ -78,22 +106,40 @@ enum CredentialBrokerTests {
         try check(client, "helper-rejected")
         try original.write(to: installed)
         try check(client, "load-updated")
-        // Clear only this disposable service to exercise an authorized legacy
-        // migration. The once-authorized fixture ACL is explicitly broker-only.
-        let chain = try LocalSigning.openKeychain(config.keychainPath)
-        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "com.stan.micbridge.credentials.v2", kSecAttrAccount as String: "receiver",
-            kSecMatchSearchList as String: [chain]]
-        try LocalSigning.check(SecItemDelete(query as CFDictionary), "Reset isolated broker migration fixture")
-        try seedLegacy(installed: installed, config: config, password: password)
-        try check(client, "load")
-        var legacyReferenceQuery = query
-        legacyReferenceQuery[kSecAttrService as String] = "com.stan.micbridge"
-        legacyReferenceQuery[kSecReturnRef as String] = true
-        legacyReferenceQuery[kSecMatchLimit as String] = kSecMatchLimitOne
-        var retainedLegacy: CFTypeRef?
-        try LocalSigning.check(SecItemCopyMatching(legacyReferenceQuery as CFDictionary, &retainedLegacy),
-                               "Verify migration retained the isolated legacy item")
+        // A writable sidecar is not a trust anchor. Replace BOTH helper and its
+        // manifest with a valid same-certificate/identifier executable. The real
+        // client remains byte-for-byte unchanged, with the original compiled pin.
+        let forgedSource = fixture.appendingPathComponent("ForgedBroker.swift")
+        let forged = fixture.appendingPathComponent("forged-broker")
+        try """
+        import Foundation
+        @main struct ForgedBroker {
+            static func main() {
+                try? Data("executed".utf8).write(to: URL(fileURLWithPath: CommandLine.arguments[0] + ".executed"))
+            }
+        }
+        """.write(to: forgedSource, atomically: true, encoding: .utf8)
+        try LocalSigning.run("/usr/bin/xcrun", common + ["-parse-as-library", forgedSource.path, "-o", forged.path],
+                             timeout: 120, captureTestDiagnostics: true)
+        try LocalSigning.sign(forged, identifier: "com.stan.micbridge.credentials", config: config)
+        let manifestURL = installed.deletingLastPathComponent().appendingPathComponent("manifest.json")
+        let manifestBytes = try Data(contentsOf: manifestURL)
+        guard var forgedManifest = try JSONSerialization.jsonObject(with: manifestBytes) as? [String: Any] else {
+            throw LocalSigning.Failure(message: "Fixture broker manifest is not an object.")
+        }
+        let forgedBytes = try Data(contentsOf: forged)
+        forgedManifest["sha256"] = SHA256.hash(data: forgedBytes).map { String(format: "%02x", $0) }.joined()
+        let unchangedClient = try Data(contentsOf: client)
+        try forgedBytes.write(to: installed)
+        try JSONSerialization.data(withJSONObject: forgedManifest).write(to: manifestURL)
+        try check(client, "helper-rejected")
+        try LocalSigning.require(!files.fileExists(atPath: installed.path + ".executed"),
+                                 "The same-signer replacement helper executed before pin rejection.")
+        try LocalSigning.require(try Data(contentsOf: client) == unchangedClient,
+                                 "The replacement-helper test changed its trusted client fixture.")
+        try original.write(to: installed)
+        try manifestBytes.write(to: manifestURL)
+        try check(client, "load-updated")
         try check(client, "remove")
         // Reintroduce a legacy value after successful removal: the v2 tombstone
         // must take precedence, so a retained old credential cannot resurrect.
@@ -134,7 +180,7 @@ enum CredentialBrokerTests {
         }
         let partition = "cdhash:" + hash.map { String(format: "%02x", $0) }.joined()
         let synthetic = #"{"origin":"https://fixture.invalid","token":"synthetic-broker-fixture"}"#
-        try LocalSigning.run("/usr/bin/security", ["add-generic-password", "-a", "receiver", "-s", "com.stan.micbridge",
+        try LocalSigning.run("/usr/bin/security", ["add-generic-password", "-U", "-a", "receiver", "-s", "com.stan.micbridge",
             "-w", synthetic, "-T", installed.path, config.keychainPath])
         try LocalSigning.run("/usr/bin/security", ["set-generic-password-partition-list", "-a", "receiver", "-s", "com.stan.micbridge",
             "-S", partition, "-k", password, config.keychainPath])
@@ -151,6 +197,10 @@ enum CredentialBrokerTests {
             do { try run() } catch {
                 // Type/code only: no request, credential bytes or argv logging.
                 fputs("Broker synthetic probe __GENERATION__ failed: \(String(reflecting: type(of: error))), code \((error as NSError).code).\n", stderr)
+                if let failure = error as? CredentialBrokerClient.Failure,
+                   let range = failure.message.range(of: "-[0-9]{4,8}", options: .regularExpression) {
+                    fputs("Broker synthetic OSStatus \(failure.message[range]).\n", stderr)
+                }
                 exit(1)
             }
         }
@@ -162,14 +212,15 @@ enum CredentialBrokerTests {
             let signing = LocalSigning.Context(anchor: root, directory: root.appendingPathComponent("signing"))
             let context = CredentialBrokerClient.Context(anchor: root, directory: root.appendingPathComponent("credentials"),
                 appURL: app, bundledBrokerURL: root.appendingPathComponent("bundled-broker"), signingContext: signing,
-                testKeychain: args[3], testExpectedParentPath: args[4])
+                testKeychain: args[3], testExpectedParentPath: args[4], testPinnedSHA256: "__PIN__".isEmpty ? nil : "__PIN__",
+                testPinnedCodeHashes: __CODE_HASHES__)
             let value = Data(#"{"origin":"https://fixture.invalid","token":"synthetic-broker-fixture"}"#.utf8)
             let updated = Data(#"{"origin":"https://fixture.invalid","token":"synthetic-updated-fixture"}"#.utf8)
             if mode.hasPrefix("raw-") {
                 try raw(root: root, mode: mode, keychain: args[3], expected: args[4]); return
             }
             switch mode {
-            case "prepare": _ = try CredentialBrokerClient.prepare(context: context)
+            case "prepare": _ = try CredentialBrokerClient.bootstrapForTests(context: context)
             case "save": _ = try CredentialBrokerClient.perform("save", payload: value, context: context)
             case "save-updated": _ = try CredentialBrokerClient.perform("save", payload: updated, context: context)
             case "load", "load-updated":

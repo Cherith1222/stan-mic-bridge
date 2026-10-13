@@ -231,7 +231,9 @@ enum LocalSigning {
         }
         try verifyPinnedApp(installedApp, config: config)
         try requireIdentity(config)
-        if (try certificateFingerprint(downloaded)) != config.certificateSHA1.lowercased() {
+        let signatureNeedsChange = try certificateFingerprint(downloaded) != config.certificateSHA1.lowercased()
+        let propagatedBrokerPin = try CredentialBrokerClient.propagatePin(from: installedApp, to: downloaded, config: config)
+        if propagatedBrokerPin || signatureNeedsChange {
             try signApp(downloaded, config: config)
         }
         try verifyPinnedApp(downloaded, config: config)
@@ -245,27 +247,60 @@ enum LocalSigning {
             try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", staged.path])
             if let config = try loadConfiguration(context) { try signApp(staged, config: config) }
         }
+        if try loadConfiguration(context) != nil {
+            try CredentialBrokerClient.installAndPin(app: staged, context: context)
+        }
     }
-    static func setup(app: URL, context supplied: Context? = nil) throws {
+    static func installedAppForSetup() throws -> URL? {
+        let home = try canonical(fileManager.homeDirectoryForCurrentUser)
+        var path = home
+        for component in ["Applications", "Stan Mic Bridge.app"] {
+            path.appendPathComponent(component)
+            var metadata = stat()
+            if lstat(path.path, &metadata) != 0 {
+                try require(errno == ENOENT, "The installed app path could not be inspected.")
+                return nil
+            }
+            try require(metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR)
+                && metadata.st_uid == geteuid() && metadata.st_mode & 0o022 == 0,
+                "The installed app must use real directories owned by the current user.")
+        }
+        return path
+    }
+    static func setup(app: URL, context supplied: Context? = nil, installedApp fixtureInstalled: URL? = nil) throws {
         let context = supplied ?? productionContext()
+        // An injected context is an isolated fixture; it must never inspect the
+        // real user's installed app. Production derives its one allowed path.
+        let installed = try supplied == nil ? installedAppForSetup() : fixtureInstalled
         try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path])
         if let config = try loadConfiguration(context) {
             // Explicit setup reuses, never silently rotates, an existing identity.
+            if let installed = installed {
+                let mainCertificate = try certificateFingerprint(installed)
+                let helperCertificate = try certificateFingerprint(helperURL(installed))
+                if mainCertificate == nil && helperCertificate == nil {
+                    // An interrupted first setup may have pinned the identity
+                    // before replacing the ad-hoc app. Never adopt its pin.
+                    try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", installed.path])
+                } else {
+                    try verifyPinnedApp(installed, config: config)
+                    _ = try CredentialBrokerClient.propagatePin(from: installed, to: app, config: config)
+                }
+            }
             try signApp(app, config: config)
+            try CredentialBrokerClient.installAndPin(app: app, context: context)
             return
         }
-        if supplied == nil {
-            let installed = fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Applications/Stan Mic Bridge.app")
-            if fileManager.fileExists(atPath: installed.path) {
+        if let installed = installed {
                 try require(try certificateFingerprint(installed) == nil && certificateFingerprint(helperURL(installed)) == nil,
                             "The installed app is already certificate-signed but its local configuration is missing. Recover the original identity/configuration instead of creating a replacement identity.")
-            }
         }
         let config = try createIdentity(context: context)
         // Pin first so cancellation cannot cause a different identity next time.
         // Only the installer staging copy is ever changed by setup.
         try saveConfiguration(config, context: context)
         try signApp(app, config: config)
+        try CredentialBrokerClient.installAndPin(app: app, context: context)
     }
     static func createIdentity(context: Context) throws -> Configuration {
         _ = try stateDirectory(context, create: true)

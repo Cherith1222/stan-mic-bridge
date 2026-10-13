@@ -710,7 +710,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.sleeping = false
             if self.enabled { self.scheduleRetry(message: "已喚醒，準備重連") }
         })
-        if connection == nil && !UpdateStaging.isStartupTest && !resumeGranted { DispatchQueue.main.async { self.configure() } }
+        if connection == nil && Credentials.lastError == nil && !UpdateStaging.isStartupTest && !resumeGranted {
+            DispatchQueue.main.async { self.configure() }
+        }
         if UpdateStaging.isMenuTest { runUpdateMenuSmoke() }
     }
 
@@ -723,7 +725,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         startItem.isEnabled = !enabled && connection != nil
         stopItem.isEnabled = enabled
         configureItem.isEnabled = !enabled
-        forgetItem.isEnabled = !enabled && connection != nil
+        forgetItem.isEnabled = !enabled && (connection != nil || Credentials.lastError != nil)
     }
 
     @objc private func checkUpdates() {

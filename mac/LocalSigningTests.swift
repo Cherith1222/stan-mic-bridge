@@ -52,6 +52,7 @@ enum LocalSigningTests {
         try assertNonExtractable(config: config)
         print("Local signing: isolated identity imported; private key is non-extractable.")
         try publicIdentityDiagnostic(config: config)
+        try oldSignerMetadataDiagnostic(source: source, root: root, config: config)
         let oldApp = root.appendingPathComponent("old/Stan Mic Bridge.app")
         let newApp = root.appendingPathComponent("new/Stan Mic Bridge.app")
         try files.createDirectory(at: oldApp.deletingLastPathComponent(), withIntermediateDirectories: false)
@@ -66,15 +67,41 @@ enum LocalSigningTests {
         info["CFBundleVersion"] = String(build - 1)
         try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0).write(to: infoURL)
         try LocalSigning.run("/usr/bin/codesign", ["--force", "--sign", "-", oldApp.path])
-        try LocalSigning.setup(app: oldApp, context: context)
+        let previousAdHoc = root.appendingPathComponent("previous-ad-hoc.app")
+        try files.copyItem(at: source, to: previousAdHoc)
+        // Identity exists but the installed fixture is still ad-hoc: an
+        // interrupted first setup may retry without adopting any old pin.
+        try LocalSigning.setup(app: oldApp, context: context, installedApp: previousAdHoc)
         let originalExecutable = try Data(contentsOf: oldApp.appendingPathComponent("Contents/MacOS/StanMicBridge"))
+        let fixedBroker = context.anchor.appendingPathComponent("credentialBroker/v1/StanMicCredentialBroker")
+        let originalBroker = try Data(contentsOf: fixedBroker)
+        let pinRelative = "Contents/Resources/CredentialBrokerPin.json"
+        let originalPin = try Data(contentsOf: oldApp.appendingPathComponent(pinRelative))
+        func pinMatches(_ app: URL) throws -> Bool {
+            guard let expected = try JSONSerialization.jsonObject(with: originalPin) as? NSDictionary else { return false }
+            return expected.isEqual(try JSONSerialization.jsonObject(with: Data(contentsOf: app.appendingPathComponent(pinRelative))))
+        }
+        let reinstall = root.appendingPathComponent("reinstall/Stan Mic Bridge.app")
+        try files.createDirectory(at: reinstall.deletingLastPathComponent(), withIntermediateDirectories: false)
+        try files.copyItem(at: source, to: reinstall)
+        try LocalSigning.setup(app: reinstall, context: context, installedApp: oldApp)
+        try LocalSigning.require(try pinMatches(reinstall)
+            && Data(contentsOf: fixedBroker) == originalBroker,
+            "Repeating explicit setup changed the frozen broker or failed to retain its sealed pin.")
+        try LocalSigning.prepareDownloadedApp(at: newApp, installedApp: oldApp, context: context)
+        // The running app and replacement helper both prepare a download. The
+        // second pass must retain the same sealed pin and immutable broker bytes.
         try LocalSigning.prepareDownloadedApp(at: newApp, installedApp: oldApp, context: context)
         try LocalSigning.verifyPinnedApp(oldApp, config: config)
         try LocalSigning.verifyPinnedApp(newApp, config: config)
         try LocalSigning.ensureContinuity(old: oldApp, new: newApp)
         try LocalSigning.require(try Data(contentsOf: oldApp.appendingPathComponent("Contents/MacOS/StanMicBridge")) == originalExecutable,
                                  "Preparing the new app changed the installed fixture.")
+        try LocalSigning.require(try Data(contentsOf: fixedBroker) == originalBroker
+            && pinMatches(newApp),
+            "Update preparation changed the frozen broker or its authenticated app pin.")
         print("Local signing: two app builds preserve exact app and helper designated requirements.")
+        print("Two update preparation passes preserve frozen broker bytes and the app-sealed pin.")
         try keychainContinuity(root: root, config: config)
         if let sources = brokerSources {
             try CredentialBrokerTests.run(root: root, config: config, sources: sources, password: password)
@@ -100,7 +127,39 @@ enum LocalSigningTests {
         try LocalSigning.require(try Data(contentsOf: oldApp.appendingPathComponent("Contents/MacOS/StanMicBridge")) == originalExecutable,
                                  "A failed update changed the installed fixture.")
         print("Local signing: bad pin, missing configuration and missing identity fail closed; original fixture retained.")
-        print("Local signing diagnostics passed: self-signed update Keychain denial reproduced, not repaired. No TCC permission grant or microphone capture was attempted.")
+        print("Direct self-signed client Keychain-read denial was reproduced; frozen-broker continuity is verified separately when broker fixtures are requested. No TCC permission grant or microphone capture was attempted.")
+    }
+    static func oldSignerMetadataDiagnostic(source: URL, root: URL, config: LocalSigning.Configuration) throws {
+        let clone = root.appendingPathComponent("old-signer-diagnostic.app")
+        try FileManager.default.copyItem(at: source, to: clone)
+        // Exact 1.3.5 signing arguments. Do not assume metadata survives merely
+        // because the input release was built with runtime/audio entitlements.
+        for (path, identifier) in [(LocalSigning.helperURL(clone), LocalSigning.helperIdentifier),
+                                   (clone, LocalSigning.appIdentifier)] {
+            try LocalSigning.run("/usr/bin/codesign", ["--force", "--sign", config.certificateSHA1,
+                "--keychain", config.keychainPath, "--identifier", identifier, "--timestamp=none",
+                "--requirements", "=designated => " + LocalSigning.requirement(identifier: identifier, fingerprint: config.certificateSHA1), path.path])
+        }
+        func inspect(_ path: URL) throws -> (runtime: Bool, audio: Bool) {
+            var output: CFDictionary?
+            try LocalSigning.check(SecCodeCopySigningInformation(try LocalSigning.staticCode(path),
+                SecCSFlags(rawValue: kSecCSSigningInformation), &output), "Inspect old-signer metadata fixture")
+            guard let info = output as? [String: Any], let flags = info[kSecCodeInfoFlags as String] as? NSNumber else {
+                throw LocalSigning.Failure(message: "Missing signature flags in old-signer fixture.")
+            }
+            let entitlements = info[kSecCodeInfoEntitlementsDict as String] as? [String: Any] ?? [:]
+            return (flags.uint32Value & 0x10000 != 0, entitlements["com.apple.security.device.audio-input"] as? Bool == true)
+        }
+        try LocalSigning.verifyPinnedApp(clone, config: config)
+        let oldMain = try inspect(clone)
+        let oldHelper = try inspect(LocalSigning.helperURL(clone))
+        print("Exact 1.3.5 signer diagnostic: app runtime=\(oldMain.runtime), app audio entitlement=\(oldMain.audio), helper runtime=\(oldHelper.runtime). This diagnostic does not claim metadata preservation.")
+        try LocalSigning.signApp(clone, config: config)
+        let repairedMain = try inspect(clone)
+        let repairedHelper = try inspect(LocalSigning.helperURL(clone))
+        try LocalSigning.require(repairedMain.runtime && repairedMain.audio && repairedHelper.runtime,
+                                 "The current explicit installer signing policy did not restore required metadata.")
+        print("Current installer signing restores runtime and audio entitlement on the same isolated clone.")
     }
     static func publicIdentityDiagnostic(config: LocalSigning.Configuration) throws {
         let task = Process()
