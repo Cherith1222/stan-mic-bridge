@@ -480,25 +480,77 @@ private func testUpdatePolicy() {
     for bad in ["../Stan Mic Bridge.app/x", "/Stan Mic Bridge.app/x", "Stan Mic Bridge.app/../x", "Stan Mic Bridge.app/a\\b", "Other.app/x"] {
         precondition(!UpdateStaging.safeEntry(bad))
     }
-    // A five-chunk burst exceeds the existing 100 ms mailbox bound: account
-    // for the dropped oldest chunk separately from subsequent expiry.
+    func audioChunks(_ frames: Int, marker: UInt8) -> [Data] {
+        stride(from: 0, to: frames, by: 1024).map {
+            Data(repeating: marker &+ UInt8($0 / 1024), count: min(1024, frames - $0) * MemoryLayout<Float>.size)
+        }
+    }
+    // A 100 ms driver callback can overlap the preceding callback while the
+    // sender is scheduled. Keep both complete bursts, including packet order.
     let box = AudioMailbox(sourceRate: 48000, startedAt: 0)
-    box.recordCaptured(5120)
-    box.recordConverted(5120)
-    for _ in 0..<5 { box.put(Data(count: 1024 * MemoryLayout<Float>.size), now: 1) }
-    precondition(box.snapshot(now: 1).overflowFrames == 1024)
-    precondition(box.take(now: 1.2) == nil)
-    let audio = box.snapshot(now: 1.2)
-    precondition(audio.expiredFrames == 4096 && audio.sentFrames == 0)
-    precondition(audio.capturedFrames == 5120 && audio.convertedFrames == 5120 && audio.maximumTapFrames == 5120)
-    box.put(Data(count: 480 * MemoryLayout<Float>.size), now: 2)
-    precondition(box.take(now: 2)?.bytes.count == 1920)
-    box.recordSent(480)
-    precondition(box.snapshot(now: 2).sentFrames == 480)
+    let firstBurst = audioChunks(4800, marker: 1)
+    let secondBurst = audioChunks(4800, marker: 20)
+    for packet in firstBurst { box.put(packet, now: 0) }
+    for packet in secondBurst { box.put(packet, now: 0.1) }
+    for packet in firstBurst + secondBurst {
+        precondition(box.take(now: 0.11)?.bytes == packet)
+        box.recordSent(packet.count / MemoryLayout<Float>.size)
+    }
+    precondition(box.take(now: 0.11) == nil)
+    precondition(box.snapshot(now: 0.11).overflowFrames == 0)
+    precondition(box.snapshot(now: 0.11).sentFrames == 9600)
+    // Crossing the former 4800-frame bound must not discard a whole chunk.
+    for frames in [4801, 5120] {
+        let burstBox = AudioMailbox(sourceRate: 48000, startedAt: 0)
+        burstBox.recordCaptured(frames)
+        burstBox.recordConverted(frames)
+        let packets = audioChunks(frames, marker: 40)
+        for packet in packets { burstBox.put(packet, now: 0) }
+        for packet in packets { precondition(burstBox.take(now: 0.01)?.bytes == packet) }
+        let audio = burstBox.snapshot(now: 0.01)
+        precondition(audio.overflowFrames == 0 && audio.expiredFrames == 0)
+        precondition(audio.capturedFrames == Int64(frames) && audio.convertedFrames == Int64(frames))
+        precondition(audio.maximumTapFrames == frames && burstBox.take(now: 0.01) == nil)
+    }
+    // Sustained congestion remains bounded and retains the newest packets.
+    let congested = AudioMailbox(sourceRate: 48000, startedAt: 0)
+    for marker in 0..<100 { congested.put(Data(repeating: UInt8(marker), count: 4096), now: 0) }
+    var retainedFrames = 0
+    var retainedPackets: [Data] = []
+    while let packet = congested.take(now: 0.01) {
+        retainedFrames += packet.bytes.count / MemoryLayout<Float>.size
+        retainedPackets.append(packet.bytes)
+    }
+    precondition(retainedFrames <= 12000 && retainedPackets.count <= 16)
+    precondition(retainedPackets == (89..<100).map { Data(repeating: UInt8($0), count: 4096) })
+    precondition(congested.snapshot(now: 0.01).overflowFrames + Int64(retainedFrames) == 100 * 1024)
+    // Small packets hit the independent packet-count bound.
+    let fragmented = AudioMailbox(sourceRate: 48000, startedAt: 0)
+    for marker in 0..<17 { fragmented.put(Data(repeating: UInt8(marker), count: 4), now: 0) }
+    for marker in 1..<17 { precondition(fragmented.take(now: 0.01)?.bytes == Data(repeating: UInt8(marker), count: 4)) }
+    precondition(fragmented.take(now: 0.01) == nil && fragmented.snapshot(now: 0.01).overflowFrames == 1)
+    // The larger capacity does not extend the existing 150 ms age cutoff.
+    let expiring = AudioMailbox(sourceRate: 48000, startedAt: 0)
+    expiring.put(Data(count: 1920), now: 0)
+    precondition(expiring.take(now: 0.149999)?.bytes.count == 1920)
+    expiring.put(Data(count: 1920), now: 0)
+    precondition(expiring.take(now: 0.15) == nil)
+    precondition(expiring.snapshot(now: 0.15).expiredFrames == 480)
+    // Preserve the input guard independently of the queue's larger capacity.
+    for invalid in [Data(), Data(count: 19201)] {
+        let invalidBox = AudioMailbox(sourceRate: 48000, startedAt: 0)
+        invalidBox.put(invalid, now: 0)
+        precondition(invalidBox.failed() && invalidBox.take(now: 0) == nil)
+    }
     print("Update, microphone authorization, and audio accounting checks passed")
 }
 
 private final class AudioMailbox {
+    // Capacity absorbs two 100 ms callback bursts plus scheduling headroom.
+    // This is a memory bound, not a playout latency target: take() still rejects
+    // packets aged 150 ms. A larger/stalled burst may still drop oldest audio.
+    private static let maximumQueuedBytes = 12000 * MemoryLayout<Float>.size
+    private static let maximumQueuedPackets = 16
     struct Snapshot {
         let sourceRate: Double
         let elapsed: Double
@@ -547,9 +599,9 @@ private final class AudioMailbox {
     func put(_ data: Data, now: Double = ProcessInfo.processInfo.systemUptime) {
         lock.lock()
         defer { lock.unlock() }
-        // 100 ms of 48 kHz float32 audio. Drop oldest audio on congestion.
+        // Keep the per-packet guard independent of the 250 ms queue capacity.
         guard !data.isEmpty, data.count <= 19200 else { fault = true; return }
-        while !packets.isEmpty && (byteCount + data.count > 19200 || packets.count >= 8) {
+        while !packets.isEmpty && (byteCount + data.count > Self.maximumQueuedBytes || packets.count >= Self.maximumQueuedPackets) {
             let dropped = packets.removeFirst().bytes.count
             byteCount -= dropped
             overflowFrames += Int64(dropped / MemoryLayout<Float>.size)

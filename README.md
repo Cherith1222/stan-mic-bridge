@@ -156,6 +156,8 @@ This opt-in tool saves a local WAV and a metadata-only JSON sidecar, refuses to 
 
 The recording captures the virtual microphone signal available to a dictation app, including the receiver and VB-CABLE path. It does not capture the Mac microphone before transmission or reveal the dictation app's internal processing. Exact-zero runs, clipping, and capture overflows are diagnostic observations; silence alone does not prove network loss. Compare the playback, Mac Audio Status counters, and the dictation result before assigning a cause.
 
+Version 1.3.9 gives the sender queue room for overlapping 100 ms capture bursts: a 250 ms byte ceiling and a 16-packet ceiling replace the former 100 ms/eight-packet limits. Packets are still sent immediately when the connection can accept them, and queued packets aged 150 ms are still discarded. The larger capacity does not introduce a deliberate playback delay. This addresses observed sender overflow when a 44.1 kHz device delivered 4,410-frame callbacks; it does not guarantee lossless delivery during network or application stalls. Compare the overflow and expired counters before and after an update, then verify actual audio.
+
 ## Browser alternative
 
 Open the same private pairing link in a microphone-capable browser, press Start, and keep that tab open. The browser stores its token only in page memory, so a reload may require the link again. The native app uses Keychain and does not need Chrome.
